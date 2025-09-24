@@ -42,7 +42,7 @@ target_include_directories(cutlass_run PRIVATE
 
 # Set CUDA properties
 set_target_properties(cutlass_run PROPERTIES
-    CUDA_ARCHITECTURES "89;"
+    CUDA_ARCHITECTURES "89;80"
     CUDA_SEPARABLE_COMPILATION ON
 )
 
