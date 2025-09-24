@@ -11,6 +11,8 @@
 
 from typing import Type, Tuple
 from enum import Enum
+from typing_extensions import deprecated
+import warnings
 
 from cutlass.utils.layout import LayoutEnum
 from cutlass.cutlass_dsl import (
@@ -33,6 +35,23 @@ from cutlass.cute.nvgpu.warpgroup import (
     OperandMajorMode,
     OperandSource,
 )
+
+
+@deprecated("Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead")
+class SmemCapacity(Enum):
+    SM90_SMEM_CAPACITY_BYTES = (228 - 1) * 1024
+
+
+warnings.warn(
+    "SMEM_CAPACITY is deprecated: Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead",
+    DeprecationWarning,
+    stacklevel=2,
+)
+# Dictionary to map compute capability to SMEM capacity
+SMEM_CAPACITY = {
+    "sm90": SmemCapacity.SM90_SMEM_CAPACITY_BYTES.value,
+}
+
 
 @dsl_user_op
 def sm90_get_smem_store_op(
@@ -79,15 +98,6 @@ def sm90_get_smem_store_op(
         return cute.make_copy_atom(CopyUniversalOp(), elem_ty_d, loc=loc, ip=ip)
 
 
-class SmemCapacity(Enum):
-    SM90_SMEM_CAPACITY_BYTES = (228 - 1) * 1024
-
-
-# Dictionary to map compute capability to SMEM capacity
-SMEM_CAPACITY = {
-    "sm90": SmemCapacity.SM90_SMEM_CAPACITY_BYTES.value,
-}
-
 def make_trivial_tiled_mma(
     a_dtype: Type[Numeric],
     b_dtype: Type[Numeric],
@@ -96,6 +106,10 @@ def make_trivial_tiled_mma(
     acc_dtype: Type[Numeric],
     atom_layout_mnk: Tuple[int, int, int],
     tiler_mn: Tuple[int, int],
+    a_source: OperandSource = OperandSource.SMEM,
+    *,
+    loc=None,
+    ip=None,
 ) -> cute.TiledMma:
     """Make a tiled MMA atom with given data type, leading dimension, cta group and mma tile shape.
     By default, the MMA atom is created with SMEM operand source for A.
@@ -131,7 +145,7 @@ def make_trivial_tiled_mma(
             a_dtype,
             acc_dtype,
             (*tiler_mn, 16),
-            OperandSource.SMEM,
+            a_source,
             a_leading_mode,
             b_leading_mode,
         )
@@ -144,7 +158,7 @@ def make_trivial_tiled_mma(
             b_dtype,
             acc_dtype,
             (*tiler_mn, 32),
-            OperandSource.SMEM,
+            a_source,
             a_leading_mode,
             b_leading_mode,
         )

@@ -22,21 +22,24 @@ from .copy import (
     CopyBulkTensorTileG2SOp,
     CopyBulkTensorTileG2SMulticastOp,
     CopyBulkTensorTileS2GOp,
+    CopyReduceBulkTensorTileS2GOp,
     CopyBulkTensorTileG2SNonExecTrait,
     CopyBulkTensorTileG2SMulticastNonExecTrait,
     CopyBulkTensorTileS2GTrait,
+    CopyReduceBulkTensorTileS2GTrait,
 )
 
 
 @dsl_user_op
-def make_tma_tile_atom(
+def make_tiled_tma_atom(
     op: Union[
         CopyBulkTensorTileG2SOp,
         CopyBulkTensorTileG2SMulticastOp,
         CopyBulkTensorTileS2GOp,
+        CopyReduceBulkTensorTileS2GOp,
     ],
     gmem_tensor: Tensor,
-    smem_layout: Layout,
+    smem_layout: Union[Layout, core.ComposedLayout],
     cta_tiler: Tiler,
     num_multicast: int = 1,
     *,
@@ -45,7 +48,7 @@ def make_tma_tile_atom(
     ip=None,
 ) -> Tuple[core.CopyAtom, Tensor]:
     """
-    Makes a TMA Copy Atom in the ``.tile`` mode to copy tiles of a GMEM tensor to/from and SMEM
+    Makes a TMA Copy Atom in the ``.tile`` mode to copy tiles of a GMEM tensor to/from SMEM
     buffer with the given Layout.
 
     Given
@@ -67,11 +70,11 @@ def make_tma_tile_atom(
        similarly to any other CuTe tensors using the algebra.
 
     :param op:            The Copy Operation to construct an Atom for
-    :type op:             Union[CopyBulkTensorTileG2SOp, CopyBulkTensorTileG2SMulticastOp, CopyBulkTensorTileS2GOp]
+    :type op:             Union[CopyBulkTensorTileG2SOp, CopyBulkTensorTileG2SMulticastOp, CopyBulkTensorTileS2GOp, CopyReduceBulkTensorTileS2GOp]
     :param gmem_tensor:   The GMEM tensor involved in the Copy
     :type gmem_tensor:    Tensor
     :param smem_layout:   The SMEM layout to construct the Copy Atom for
-    :type smem_layout:    Layout
+    :type smem_layout:    Union[Layout, core.ComposedLayout]
     :param cta_tiler:     The CTA Tiler to use
     :type cta_tiler:      Tiler
     :param num_multicast: The multicast factor
@@ -141,6 +144,17 @@ def make_tma_tile_atom(
             ip=ip,
         )
         return core.CopyAtom(op, CopyBulkTensorTileS2GTrait(res[0])), res[1]
+    elif isinstance(op, CopyReduceBulkTensorTileS2GOp):
+        res = _cute_nvgpu_ir.atom_make_non_exec_tiled_tma_reduce(
+            gmem_tensor.value,
+            smem_layout,
+            cta_v_map,
+            op._to_ir(),
+            internal_type=internal_type,
+            loc=loc,
+            ip=ip,
+        )
+        return core.CopyAtom(op, CopyReduceBulkTensorTileS2GTrait(res[0])), res[1]
     else:
         raise ValueError(f"expects a bulk tensor (TMA) Copy Op, but got {op}")
 

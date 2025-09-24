@@ -37,6 +37,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
+import cutlass.pipeline as pipeline
+import cutlass.cute.testing as testing
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
 
@@ -225,7 +227,7 @@ class PersistentDenseGemmKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
-        self.num_smem_capacity = sm100_utils.SMEM_CAPACITY["sm100"]
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -297,7 +299,7 @@ class PersistentDenseGemmKernel:
             self.epi_tile,
             self.c_dtype,
             self.c_layout,
-            self.num_smem_capacity,
+            self.smem_capacity,
             self.occupancy,
             self.use_tma_store,
         )
@@ -389,9 +391,11 @@ class PersistentDenseGemmKernel:
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # Setup TMA load for A
-        a_op = self._get_tma_atom_kind(atom_thr_size, self.is_a_mcast)
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tma_tile_atom_A(
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             a_op,
             a,
             a_smem_layout,
@@ -404,9 +408,11 @@ class PersistentDenseGemmKernel:
         )
 
         # Setup TMA load for B
-        b_op = self._get_tma_atom_kind(atom_thr_size, self.is_b_mcast)
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tma_tile_atom_B(
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
             b,
             b_smem_layout,
@@ -430,7 +436,7 @@ class PersistentDenseGemmKernel:
                 cute.make_identity_layout(c.shape), self.epi_tile
             )
             epi_smem_layout = cute.slice_(self.c_smem_layout_staged, (None, None, 0))
-            tma_atom_c, tma_tensor_c = cpasync.make_tma_tile_atom(
+            tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
                 c,
                 epi_smem_layout,
@@ -504,7 +510,6 @@ class PersistentDenseGemmKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
-            smem=self.shared_storage.size_in_bytes(),
             stream=stream,
         )
         return
@@ -571,12 +576,12 @@ class PersistentDenseGemmKernel:
         tmem_holding_buf = storage.tmem_holding_buf
 
         # Initialize mainloop ab_pipeline (barrier) and states
-        ab_pipeline_producer_group = utils.CooperativeGroup(utils.Agent.Thread)
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        ab_pipeline_consumer_group = utils.CooperativeGroup(
-            utils.Agent.Thread, num_tma_producer
+        ab_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, num_tma_producer
         )
-        ab_pipeline = utils.PipelineTmaUmma.create(
+        ab_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.ab_full_mbar_ptr.data_ptr(),
             num_stages=self.num_ab_stage,
             producer_group=ab_pipeline_producer_group,
@@ -586,14 +591,14 @@ class PersistentDenseGemmKernel:
         )
 
         # Initialize acc_pipeline (barrier) and states
-        acc_pipeline_producer_group = utils.CooperativeGroup(utils.Agent.Thread)
+        acc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         num_acc_consumer_threads = len(self.epilog_warp_id) * (
             2 if use_2cta_instrs else 1
         )
-        acc_pipeline_consumer_group = utils.CooperativeGroup(
-            utils.Agent.Thread, num_acc_consumer_threads
+        acc_pipeline_consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, num_acc_consumer_threads
         )
-        acc_pipeline = utils.PipelineUmmaAsync.create(
+        acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_full_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=acc_pipeline_producer_group,
@@ -606,7 +611,7 @@ class PersistentDenseGemmKernel:
             if warp_idx == self.tma_warp_id:
                 num_tmem_dealloc_threads = 32
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_init_arrive_cnt(
+                    cute.arch.mbarrier_init(
                         tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads
                     )
         cute.arch.mbarrier_init_fence()
@@ -640,7 +645,7 @@ class PersistentDenseGemmKernel:
         #
         a_full_mcast_mask = None
         b_full_mcast_mask = None
-        if self.is_a_mcast or self.is_b_mcast or use_2cta_instrs:
+        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
             a_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
             )
@@ -651,29 +656,29 @@ class PersistentDenseGemmKernel:
         #
         # Local_tile partition global tensors
         #
-        # (bM, bK, loopM, loopK, loopL)
+        # (bM, bK, RestM, RestK, RestL)
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
-        # (bN, bK, loopN, loopK, loopL)
+        # (bN, bK, RestN, RestK, RestL)
         gB_nkl = cute.local_tile(
             mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
-        # (bM, bN, loopM, loopN, loopL)
+        # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
-        k_block_cnt = cute.size(gA_mkl, mode=[3])
+        k_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         #
         # Partition global tensor for TiledMMA_A/B/C
         #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
+        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tCgA = thr_mma.partition_A(gA_mkl)
-        # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
+        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
         tCgB = thr_mma.partition_B(gB_nkl)
-        # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
+        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
 
         #
@@ -684,7 +689,7 @@ class PersistentDenseGemmKernel:
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
         # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
+        # ((atom_v, rest_v), RestM, RestK, RestL)
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
             block_in_cluster_coord_vmnk[2],
@@ -697,7 +702,7 @@ class PersistentDenseGemmKernel:
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
         # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
+        # ((atom_v, rest_v), RestM, RestK, RestL)
         tBsB, tBgB = cpasync.tma_partition(
             tma_atom_b,
             block_in_cluster_coord_vmnk[1],
@@ -743,12 +748,11 @@ class PersistentDenseGemmKernel:
             )
             work_tile = tile_sched.initial_work_tile_info()
 
-            ab_producer_state = utils.make_pipeline_state(
-                utils.PipelineUserType.Producer, self.num_ab_stage
+            ab_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
 
             while work_tile.is_valid_tile:
-
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -760,26 +764,26 @@ class PersistentDenseGemmKernel:
                 #
                 # Slice to per mma tile index
                 #
-                # ((atom_v, rest_v), loopK)
+                # ((atom_v, rest_v), RestK)
                 tAgA_slice = tAgA[
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
                 ]
-                # ((atom_v, rest_v), loopK)
+                # ((atom_v, rest_v), RestK)
                 tBgB_slice = tBgB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
 
-                # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
+                # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
-                if ab_producer_state.count < k_block_cnt:
+                if ab_producer_state.count < k_tile_cnt:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(
                         ab_producer_state
                     )
                 #
                 # Tma load loop
                 #
-                for k_block in cutlass.range_dynamic(0, k_block_cnt, 1, unroll=1):
+                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Conditionally wait for AB buffer empty
                     ab_pipeline.producer_acquire(
                         ab_producer_state, peek_ab_empty_status
@@ -801,10 +805,10 @@ class PersistentDenseGemmKernel:
                         mcast_mask=b_full_mcast_mask,
                     )
 
-                    # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
+                    # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
-                    if ab_producer_state.count < k_block_cnt:
+                    if ab_producer_state.count < k_tile_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(
                             ab_producer_state
                         )
@@ -852,15 +856,14 @@ class PersistentDenseGemmKernel:
             )
             work_tile = tile_sched.initial_work_tile_info()
 
-            ab_consumer_state = utils.make_pipeline_state(
-                utils.PipelineUserType.Consumer, self.num_ab_stage
+            ab_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
-            acc_producer_state = utils.make_pipeline_state(
-                utils.PipelineUserType.Producer, self.num_acc_stage
+            acc_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_acc_stage
             )
 
             while work_tile.is_valid_tile:
-
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -873,10 +876,10 @@ class PersistentDenseGemmKernel:
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
 
-                # Peek (try_wait) AB buffer full for k_block = 0
+                # Peek (try_wait) AB buffer full for k_tile = 0
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
-                if ab_consumer_state.count < k_block_cnt and is_leader_cta:
+                if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
                     peek_ab_full_status = ab_pipeline.consumer_try_wait(
                         ab_consumer_state
                     )
@@ -895,7 +898,7 @@ class PersistentDenseGemmKernel:
                 #
                 # Mma mainloop
                 #
-                for k_block in cutlass.range_dynamic(0, k_block_cnt, 1, unroll=1):
+                for k_tile in range(k_tile_cnt):
                     if is_leader_cta:
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(
@@ -903,32 +906,32 @@ class PersistentDenseGemmKernel:
                         )
 
                         # tCtAcc += tCrA * tCrB
-                        num_kphases = cute.size(tCrA, mode=[2])
-                        for kphase_idx in range(num_kphases):
-                            kphase_coord = (
+                        num_kblocks = cute.size(tCrA, mode=[2])
+                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                            kblock_coord = (
                                 None,
                                 None,
-                                kphase_idx,
+                                kblock_idx,
                                 ab_consumer_state.index,
                             )
 
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc,
-                                tCrA[kphase_coord],
-                                tCrB[kphase_coord],
+                                tCrA[kblock_coord],
+                                tCrB[kblock_coord],
                                 tCtAcc,
                             )
-                            # Enable accumulate on tCtAcc after first kphase
+                            # Enable accumulate on tCtAcc after first kblock
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                         # Async arrive AB buffer empty
                         ab_pipeline.consumer_release(ab_consumer_state)
 
-                    # Peek (try_wait) AB buffer full for k_block = k_block + 1
+                    # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     ab_consumer_state.advance()
                     peek_ab_full_status = cutlass.Boolean(1)
-                    if ab_consumer_state.count < k_block_cnt:
+                    if ab_consumer_state.count < k_tile_cnt:
                         if is_leader_cta:
                             peek_ab_full_status = ab_pipeline.consumer_try_wait(
                                 ab_consumer_state
@@ -989,10 +992,12 @@ class PersistentDenseGemmKernel:
             # Partition for epilogue
             #
             epi_tidx = tidx
-            tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
-                self.epilog_tmem_copy_and_partition(
-                    epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
-                )
+            (
+                tiled_copy_t2r,
+                tTR_tAcc_base,
+                tTR_rAcc,
+            ) = self.epilog_tmem_copy_and_partition(
+                epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
 
             tTR_rC = None
@@ -1008,16 +1013,20 @@ class PersistentDenseGemmKernel:
                 tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                     tiled_copy_t2r, tTR_rC, epi_tidx, sC
                 )
-                tma_atom_c, bSG_sC, bSG_gC_partitioned = (
-                    self.epilog_gmem_copy_and_partition(
-                        epi_tidx, tma_atom_c, tCgC, epi_tile, sC
-                    )
+                (
+                    tma_atom_c,
+                    bSG_sC,
+                    bSG_gC_partitioned,
+                ) = self.epilog_gmem_copy_and_partition(
+                    epi_tidx, tma_atom_c, tCgC, epi_tile, sC
                 )
             else:
-                simt_atom, tTR_rC, tTR_gC_partitioned = (
-                    self.epilog_gmem_copy_and_partition(
-                        epi_tidx, tiled_copy_t2r, tCgC, epi_tile, sC
-                    )
+                (
+                    simt_atom,
+                    tTR_rC,
+                    tTR_gC_partitioned,
+                ) = self.epilog_gmem_copy_and_partition(
+                    epi_tidx, tiled_copy_t2r, tCgC, epi_tile, sC
                 )
 
             #
@@ -1028,25 +1037,24 @@ class PersistentDenseGemmKernel:
             )
             work_tile = tile_sched.initial_work_tile_info()
 
-            acc_consumer_state = utils.make_pipeline_state(
-                utils.PipelineUserType.Consumer, self.num_acc_stage
+            acc_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
 
             c_pipeline = None
             if cutlass.const_expr(self.use_tma_store):
                 # Threads/warps participating in tma store pipeline
-                c_producer_group = utils.CooperativeGroup(
-                    utils.Agent.Thread,
+                c_producer_group = pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
                     32 * len(self.epilog_warp_id),
                     32 * len(self.epilog_warp_id),
                 )
-                c_pipeline = utils.PipelineTmaStore.create(
+                c_pipeline = pipeline.PipelineTmaStore.create(
                     num_stages=self.num_c_stage,
                     producer_group=c_producer_group,
                 )
 
             while work_tile.is_valid_tile:
-
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
                 mma_tile_coord_mnl = (
@@ -1105,7 +1113,7 @@ class PersistentDenseGemmKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
-                for subtile_idx in cutlass.range_dynamic(subtile_cnt):
+                for subtile_idx in cutlass.range(subtile_cnt):
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
@@ -1259,11 +1267,11 @@ class PersistentDenseGemmKernel:
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_M, STAGE)
         tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
 
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, loopM, loopN, loopL)
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
         gC_mnl_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
         # (T2R, T2R_M, T2R_N)
         tTR_rAcc = cute.make_fragment(
@@ -1300,11 +1308,7 @@ class PersistentDenseGemmKernel:
         copy_atom_r2s = sm100_utils.get_smem_store_op(
             self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
         )
-        tiled_copy_r2s = cute.make_tiled_copy(
-            copy_atom_r2s,
-            layout_tv=tiled_copy_t2r.layout_dst_tv_tiled,
-            tiler_mn=tiled_copy_t2r.tiler_mn,
-        )
+        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         # (R2S, R2S_M, R2S_N, PIPE_D)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
         tRS_sC = thr_copy_r2s.partition_D(sC)
@@ -1346,7 +1350,7 @@ class PersistentDenseGemmKernel:
                 - tTR_gC: The partitioned global tensor C
         :rtype: Tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
         """
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, loopM, loopN, loopL)
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
         gC_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
@@ -1355,7 +1359,7 @@ class PersistentDenseGemmKernel:
             sC_for_tma_partition = cute.group_modes(sC, 0, 2)
             gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
             # ((ATOM_V, REST_V), EPI_M, EPI_N)
-            # ((ATOM_V, REST_V), EPI_M, EPI_N, loopM, loopN, loopL)
+            # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
             bSG_sC, bSG_gC = cpasync.tma_partition(
                 tma_atom_c,
                 0,
@@ -1366,7 +1370,7 @@ class PersistentDenseGemmKernel:
             return tma_atom_c, bSG_sC, bSG_gC
         else:
             tiled_copy_t2r = atom
-            # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
+            # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
             thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
             tTR_gC = thr_copy_t2r.partition_D(gC_epi)
             # (T2R, T2R_M, T2R_N)
@@ -1385,7 +1389,7 @@ class PersistentDenseGemmKernel:
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
-        num_smem_capacity: int,
+        smem_capacity: int,
         occupancy: int,
         use_tma_store: bool,
     ) -> Tuple[int, int, int]:
@@ -1405,8 +1409,8 @@ class PersistentDenseGemmKernel:
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C.
         :type c_layout: utils.LayoutEnum
-        :param num_smem_capacity: Total available shared memory capacity in bytes.
-        :type num_smem_capacity: int
+        :param smem_capacity: Total available shared memory capacity in bytes.
+        :type smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
         :type occupancy: int
         :param use_tma_store: Whether TMA store is enabled.
@@ -1461,7 +1465,7 @@ class PersistentDenseGemmKernel:
         # Subtract reserved bytes and initial C stages bytes
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (
-            num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
+            smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes)
         ) // ab_bytes_per_stage
 
         # Refine epilogue stages:
@@ -1469,7 +1473,7 @@ class PersistentDenseGemmKernel:
         # Add remaining unused smem to epilogue
         if use_tma_store:
             num_c_stage += (
-                num_smem_capacity
+                smem_capacity
                 - occupancy * ab_bytes_per_stage * num_ab_stage
                 - occupancy * (mbar_helpers_bytes + c_bytes)
             ) // (occupancy * c_bytes_per_stage)
@@ -1511,36 +1515,6 @@ class PersistentDenseGemmKernel:
         )
 
         return tile_sched_params, grid
-
-    @staticmethod
-    def _get_tma_atom_kind(
-        atom_sm_cnt: cutlass.Int32, mcast: cutlass.Boolean
-    ) -> Union[
-        cpasync.CopyBulkTensorTileG2SMulticastOp, cpasync.CopyBulkTensorTileG2SOp
-    ]:
-        """
-        Select the appropriate TMA copy atom based on the number of SMs and the multicast flag.
-
-        :param atom_sm_cnt: The number of SMs
-        :type atom_sm_cnt: cutlass.Int32
-        :param mcast: The multicast flag
-        :type mcast: cutlass.Boolean
-
-        :return: The appropriate TMA copy atom kind
-        :rtype: cpasync.CopyBulkTensorTileG2SMulticastOp or cpasync.CopyBulkTensorTileG2SOp
-
-        :raise ValueError: If the atom_sm_cnt is invalid
-        """
-        if atom_sm_cnt == 2 and mcast:
-            return cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.TWO)
-        elif atom_sm_cnt == 2 and not mcast:
-            return cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
-        elif atom_sm_cnt == 1 and mcast:
-            return cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
-        elif atom_sm_cnt == 1 and not mcast:
-            return cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
-
-        raise ValueError(f"Invalid atom_sm_cnt: {atom_sm_cnt} and {mcast}")
 
     @staticmethod
     def _compute_num_tmem_alloc_cols(
@@ -1846,7 +1820,7 @@ class PersistentDenseGemmKernel:
         return can_implement
 
 
-def run_dense_gemm(
+def run(
     mnkl: Tuple[int, int, int, int],
     ab_dtype: Type[cutlass.Numeric],
     c_dtype: Type[cutlass.Numeric],
@@ -1854,17 +1828,58 @@ def run_dense_gemm(
     a_major: str,
     b_major: str,
     c_major: str,
-    mma_tiler_mn: Tuple[int, int],
-    cluster_shape_mn: Tuple[int, int],
-    use_2cta_instrs: bool,
-    use_tma_store: bool,
-    tolerance: float,
+    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    cluster_shape_mn: Tuple[int, int] = (2, 1),
+    use_2cta_instrs: bool = True,
+    use_tma_store: bool = True,
+    tolerance: float = 1e-01,
     warmup_iterations: int = 0,
     iterations: int = 1,
     skip_ref_check: bool = False,
+    use_cold_l2: bool = False,
+    **kwargs,
 ):
-    """
-    Prepare A/B/C tensors, launch GPU kernel, and reference checking.
+    """Execute a persistent batched dense GEMM operation on Blackwell architecture with performance benchmarking.
+
+    This function prepares input tensors, configures and launches the persistent GEMM kernel,
+    optionally performs reference validation, and benchmarks the execution performance.
+
+    :param mnkl: Problem size (M, N, K, L)
+    :type mnkl: Tuple[int, int, int, int]
+    :param ab_dtype: Data type for input tensors A and B
+    :type ab_dtype: Type[cutlass.Numeric]
+    :param c_dtype: Data type for output tensor C
+    :type c_dtype: Type[cutlass.Numeric]
+    :param acc_dtype: Data type for accumulation during matrix multiplication
+    :type acc_dtype: Type[cutlass.Numeric]
+    :param a_major/b_major/c_major: Memory layout of tensor A/B/C
+    :type a_major/b_major/c_major: str
+    :param mma_tiler_mn: MMA tiling size. If not specified in the decorator parameters, the autotuner will use the
+        default value of (256, 256). Otherwise, the autotuner will use the value specified in the decorator parameters.
+    :type mma_tiler_mn: Tuple[int, int], optional
+    :param cluster_shape_mn: Cluster shape. If not specified in the decorator parameters, the autotuner will use the
+        default value of (2, 1). Otherwise, the autotuner will use the value specified in the decorator parameters.
+    :type cluster_shape_mn: Tuple[int, int], optional
+    :param use_2cta_instrs: Whether to use 2CTA instructions. If not specified in the decorator parameters, the autotuner
+        will use the default value of True. Otherwise, the autotuner will use the value specified in the decorator parameters.
+    :type use_2cta_instrs: bool, optional
+    :param use_tma_store: Whether to use TMA store. If not specified in the decorator parameters, the autotuner will use
+        the default value of True. Otherwise, the autotuner will use the value specified in the decorator parameters.
+    :type use_tma_store: bool, optional
+    :param tolerance: Tolerance value for reference validation comparison, defaults to 1e-01
+    :type tolerance: float, optional
+    :param warmup_iterations: Number of warmup iterations before benchmarking, defaults to 0
+    :type warmup_iterations: int, optional
+    :param iterations: Number of benchmark iterations to run, defaults to 1
+    :type iterations: int, optional
+    :param skip_ref_check: Whether to skip reference result validation, defaults to False
+    :type skip_ref_check: bool, optional
+    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
+    :type use_cold_l2: bool, optional
+    :raises RuntimeError: If CUDA GPU is not available
+    :raises ValueError: If the configuration is invalid or unsupported by the kernel
+    :return: Execution time of the GEMM kernel
+    :rtype: float
     """
     print(f"Running Blackwell Persistent Dense GEMM test with:")
     print(f"mnkl: {mnkl}")
@@ -1877,6 +1892,7 @@ def run_dense_gemm(
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
+    print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
 
     # Unpack parameters
     m, n, k, l = mnkl
@@ -1953,15 +1969,15 @@ def run_dense_gemm(
             is_dynamic_layout=is_dynamic_layout,
         )
 
-        return f32_torch_tensor, cute_tensor, torch_tensor
+        return f32_torch_tensor, cute_tensor, torch_tensor, torch_tensor_cpu
 
-    a_ref, a_tensor, a_torch = create_and_permute_tensor(
+    a_ref, a_tensor, a_torch, a_torch_cpu = create_and_permute_tensor(
         l, m, k, a_major == "m", ab_dtype, is_dynamic_layout=True
     )
-    b_ref, b_tensor, b_torch = create_and_permute_tensor(
+    b_ref, b_tensor, b_torch, b_torch_cpu = create_and_permute_tensor(
         l, n, k, b_major == "n", ab_dtype, is_dynamic_layout=True
     )
-    c_ref, c_tensor, c_torch = create_and_permute_tensor(
+    c_ref, c_tensor, c_torch, c_torch_cpu = create_and_permute_tensor(
         l, m, n, c_major == "m", c_dtype, is_dynamic_layout=True
     )
 
@@ -1989,16 +2005,8 @@ def run_dense_gemm(
         gemm, a_tensor, b_tensor, c_tensor, max_active_clusters, current_stream
     )
 
-    # Launch GPU kernel
-    # Warm up
-    for i in range(warmup_iterations):
-        compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
-    # Execution
-    for i in range(iterations):
-        compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
-
-    # Compute reference result
     if not skip_ref_check:
+        compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         if ab_dtype in {
             cutlass.Int8,
             cutlass.Uint8,
@@ -2049,6 +2057,40 @@ def run_dense_gemm(
             atol=tolerance,
             rtol=1e-05,
         )
+
+    def generate_tensors():
+        a_tensor, _ = cutlass_torch.cute_tensor_like(
+            a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        b_tensor, _ = cutlass_torch.cute_tensor_like(
+            b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        c_tensor, _ = cutlass_torch.cute_tensor_like(
+            c_torch_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        return testing.JitArguments(a_tensor, b_tensor, c_tensor, current_stream)
+
+    workspace_count = 1
+    if use_cold_l2:
+        one_workspace_bytes = (
+            a_torch_cpu.numel() * a_torch_cpu.element_size()
+            + b_torch_cpu.numel() * b_torch_cpu.element_size()
+            + c_torch_cpu.numel() * c_torch_cpu.element_size()
+        )
+        workspace_count = testing.get_workspace_count(
+            one_workspace_bytes, warmup_iterations, iterations
+        )
+
+    exec_time = testing.benchmark(
+        compiled_gemm,
+        workspace_generator=generate_tensors,
+        workspace_count=workspace_count,
+        stream=current_stream,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+    )
+
+    return exec_time  # Return execution time in microseconds
 
 
 if __name__ == "__main__":
@@ -2112,6 +2154,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip_ref_check", action="store_true", help="Skip reference checking"
     )
+    parser.add_argument(
+        "--use_cold_l2",
+        action="store_true",
+        default=False,
+        help="Use circular buffer tensor sets to ensure L2 cold cache",
+    )
 
     args = parser.parse_args()
 
@@ -2124,7 +2172,7 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
-    run_dense_gemm(
+    run(
         args.mnkl,
         args.ab_dtype,
         args.c_dtype,
@@ -2140,5 +2188,6 @@ if __name__ == "__main__":
         args.warmup_iterations,
         args.iterations,
         args.skip_ref_check,
+        args.use_cold_l2,
     )
     print("PASS")

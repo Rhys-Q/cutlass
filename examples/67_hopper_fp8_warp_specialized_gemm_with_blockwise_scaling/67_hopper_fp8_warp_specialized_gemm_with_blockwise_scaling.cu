@@ -129,7 +129,7 @@ using ScaleConfig = decltype(cutlass::detail::sm90_trivial_blockwise_scale_confi
 using LayoutSFA             = decltype(ScaleConfig::deduce_layoutSFA());                     // Layout type for SFA matrix operand
 using LayoutSFB             = decltype(ScaleConfig::deduce_layoutSFB());                     // Layout type for SFB matrix operand
 
-using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum; 
+using KernelSchedule      = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise; 
 using EpilogueSchedule    = cutlass::epilogue::TmaWarpSpecializedCooperative;
 
 using EpilogueTileType    = cutlass::epilogue::collective::EpilogueTileAuto;
@@ -358,7 +358,7 @@ void initialize(const Options<RasterOrderOptions> &options) {
   // Layout SFA and SFB represent logically broadcasting data in CuTe.
   // E.g., if Layout SFA has shape ((ScaleGranularityM, M / ScaleGranularityM), (ScaleGraunularityK, K / ScaleGranularityK))
   // and strides ((0, 1), (0, M / ScaleGraunuarlityM)), then each collection of ScaleGranularityM x ScaleGranularityK
-  // indecies in the tensor map to the same offset.
+  // indices in the tensor map to the same offset.
 
   layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(options.m, options.n, options.k, options.l));
   layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(options.m, options.n, options.k, options.l));

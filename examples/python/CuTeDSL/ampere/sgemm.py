@@ -35,6 +35,8 @@ import torch
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.testing as testing
+import cutlass.torch as cutlass_torch
 import cutlass.utils as utils
 from cutlass.cute.runtime import from_dlpack
 
@@ -109,6 +111,7 @@ class SGemm:
         mB: cute.Tensor,
         mC: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
     ):
         self.a_major_mode = utils.LayoutEnum.from_tensor(mA)
         self.b_major_mode = utils.LayoutEnum.from_tensor(mB)
@@ -131,10 +134,6 @@ class SGemm:
         sB_layout = cute.make_layout(
             (self._bN, self._bK, self._num_stages),
             stride=(1, (self._bN + padding_b), self._bK * (self._bN + padding_b)),
-        )
-
-        smem_size = cute.size_in_bytes(mA.element_type, sA_layout) + cute.size_in_bytes(
-            mB.element_type, sB_layout
         )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -168,7 +167,7 @@ class SGemm:
             num_bits_per_copy=mB.element_type.width,
         )
 
-        if self.a_major_mode == utils.LayoutEnum.COL_MAJOR:
+        if cutlass.const_expr(self.a_major_mode == utils.LayoutEnum.COL_MAJOR):
             num_vectorized = 4 if (mA.layout.max_alignment % 16 == 0) else 1
             atom_async_copy_A = cute.make_copy_atom(
                 cute.nvgpu.cpasync.CopyG2SOp(),
@@ -182,7 +181,7 @@ class SGemm:
             )
             vA = cute.make_layout((num_vectorized, 1))
 
-        if self.b_major_mode == utils.LayoutEnum.COL_MAJOR:
+        if cutlass.const_expr(self.b_major_mode == utils.LayoutEnum.COL_MAJOR):
             num_vectorized = 4 if (mB.layout.max_alignment % 16 == 0) else 1
             atom_async_copy_B = cute.make_copy_atom(
                 cute.nvgpu.cpasync.CopyG2SOp(),
@@ -222,7 +221,7 @@ class SGemm:
         atoms_layout = cute.make_layout(
             (self._num_threads // 16, 16, 1), stride=(16, 1, 0)
         )
-        if self.c_major_mode == utils.LayoutEnum.COL_MAJOR:
+        if cutlass.const_expr(self.c_major_mode == utils.LayoutEnum.COL_MAJOR):
             atoms_layout = cute.make_layout(
                 (16, self._num_threads // 16, 1), stride=(1, 16, 0)
             )
@@ -255,7 +254,7 @@ class SGemm:
         ).launch(
             grid=grid_dim,
             block=[cute.size(atoms_layout), 1, 1],
-            smem=smem_size,
+            stream=stream,
         )
 
     @cute.kernel
@@ -540,8 +539,8 @@ class SGemm:
         # 3. Combining the smem and register pipelines results in the mainloop.
         # ///////////////////////////////////////////////////////////////////////////////
 
-        for _ in cutlass.range_dynamic(k_tile_count, unroll=1):
-            for k_block in range(k_block_max):
+        for _ in range(k_tile_count):
+            for k_block in range(k_block_max, unroll_full=True):
                 if k_block == k_block_max - 1:
                     tCsA_p = tCsA[None, None, None, smem_pipe_read]
                     tCsB_p = tCsB[None, None, None, smem_pipe_read]
@@ -630,17 +629,50 @@ class SGemm:
         return
 
 
-def main(
+def run(
+    mnk: Tuple[int, int, int],
     a_major: str,
     b_major: str,
     c_major: str,
-    problem_shape: Tuple[int, int, int],
+    static_shape: bool = False,
     warmup_iterations: int = 2,
     iterations: int = 100,
     skip_ref_check: bool = False,
+    use_cold_l2: bool = False,
+    **kwargs,
 ):
-    torch.manual_seed(1024)
-    M, N, K = problem_shape
+    """Execute SIMT GEMM operation and benchmark performance.
+
+    :param mnk: GEMM problem size (M, N, K, L)
+    :type mnk: Tuple[int, int, int, int]
+    :param a_major: Memory layout of tensor A
+    :type a_major: str
+    :param b_major: Memory layout of tensor B
+    :type b_major: str
+    :param c_major: Memory layout of tensor C
+    :type c_major: str
+    :param static_shape: Whether to use static shape optimization, defaults to False
+    :type static_shape: bool, optional
+    :param warmup_iterations: Number of warmup iterations before benchmarking, defaults to 2
+    :type warmup_iterations: int, optional
+    :param iterations: Number of benchmark iterations to run, defaults to 100
+    :type iterations: int, optional
+    :param skip_ref_check: Skip validation against reference implementation, defaults to False
+    :type skip_ref_check: bool, optional
+    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
+    :type use_cold_l2: bool, optional
+    :return: Execution time of the GEMM kernel in microseconds
+    :rtype: float
+    """
+    print(f"Running Ampere SIMT GEMM example:")
+    print(f"mnk: {mnk}")
+    print(f"A major: {a_major}, B major: {b_major}, C major: {c_major}")
+    print(f"Static shape: {static_shape}")
+    print(f"Warmup iterations: {warmup_iterations}")
+    print(f"Iterations: {iterations}")
+    print(f"Skip reference checking: {skip_ref_check}")
+    print(f"Use cold L2: {use_cold_l2}")
+    M, N, K = mnk
 
     # Create and permute tensor A/B/C
     def create_and_permute_tensor(mode0, mode1, is_mode0_major, dtype):
@@ -694,55 +726,97 @@ def main(
 
     sgemm = SGemm()
 
+    # Get current CUDA stream from PyTorch
+    torch_stream = torch.cuda.current_stream()
+    # Get the raw stream pointer as a CUstream
+    current_stream = cuda.CUstream(torch_stream.cuda_stream)
+
     print("Compiling kernel with cute.compile ...")
     start_time = time.time()
-    gemm = cute.compile(sgemm, a_tensor, b_tensor, c_tensor)
+    compiled_fn = cute.compile(
+        sgemm,
+        a_tensor,
+        b_tensor,
+        c_tensor,
+        stream=current_stream,
+    )
     compilation_time = time.time() - start_time
     print(f"Compilation time: {compilation_time:.4f} seconds")
 
     print("Executing GEMM kernel...")
 
-    # Get current CUDA stream from PyTorch
-    torch_stream = torch.cuda.current_stream()
-
-    # Get the raw stream pointer as a CUstream
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    # Create CUDA events for timing
-    start_event = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DEFAULT)[1]
-    end_event = cuda.cuEventCreate(cuda.CUevent_flags.CU_EVENT_DEFAULT)[1]
-
-    # Warmup
-    for _ in range(warmup_iterations):
-        gemm(a_tensor, b_tensor, c_tensor)
-
-    # Use the current stream for CUDA events instead of the default stream
-    # Record start event
-    cuda.cuEventRecord(start_event, current_stream)
-
-    # Execute the kernel
-    for _ in range(iterations):
-        gemm(a_tensor, b_tensor, c_tensor)
-
-    # Record end event
-    cuda.cuEventRecord(end_event, current_stream)
-    cuda.cuEventSynchronize(end_event)
-
-    # Calculate elapsed time
-    err, elapsed_time = cuda.cuEventElapsedTime(start_event, end_event)
-
-    # Print execution results
-    print(f"Kernel execution time: {elapsed_time / iterations:.4f} ms")
-
-    # Destroy events
-    cuda.cuEventDestroy(start_event)
-    cuda.cuEventDestroy(end_event)
-
     if not skip_ref_check:
+        compiled_fn(a_tensor, b_tensor, c_tensor)
+        torch.cuda.synchronize()
         print("Verifying results...")
         ref = torch.einsum("mk,nk->mn", a, b)
         torch.testing.assert_close(c.cpu(), ref.cpu(), atol=1e-03, rtol=1e-05)
         print("Results verified successfully!")
+
+    def generate_tensors():
+        # Create new tensors for each workspace to ensure cold L2 cache
+        a_workspace = create_and_permute_tensor(M, K, a_major == "m", torch.float32)
+        b_workspace = create_and_permute_tensor(N, K, b_major == "n", torch.float32)
+        c_workspace = create_and_permute_tensor(M, N, c_major == "m", torch.float32)
+
+        if static_shape:
+            a_tensor_workspace = (
+                from_dlpack(a_workspace, assumed_align=16)
+                .mark_layout_dynamic(leading_dim=(1 if a_major == "k" else 0))
+                .mark_compact_shape_dynamic(
+                    mode=(1 if a_major == "k" else 0),
+                    divisibility=divisibility_a,
+                )
+            )
+        else:
+            a_tensor_workspace = from_dlpack(a_workspace, assumed_align=16)
+
+        b_tensor_workspace = (
+            from_dlpack(b_workspace, assumed_align=16)
+            .mark_layout_dynamic(leading_dim=(1 if b_major == "k" else 0))
+            .mark_compact_shape_dynamic(
+                mode=(1 if b_major == "k" else 0),
+                divisibility=divisibility_b,
+            )
+        )
+
+        c_tensor_workspace = (
+            from_dlpack(c_workspace, assumed_align=16)
+            .mark_layout_dynamic(leading_dim=(1 if c_major == "n" else 0))
+            .mark_compact_shape_dynamic(
+                mode=(1 if c_major == "n" else 0),
+                divisibility=divisibility_c,
+            )
+        )
+
+        return testing.JitArguments(
+            a_tensor_workspace, b_tensor_workspace, c_tensor_workspace, current_stream
+        )
+
+    workspace_count = 1
+    if use_cold_l2:
+        one_workspace_bytes = (
+            a.numel() * a.element_size()
+            + b.numel() * b.element_size()
+            + c.numel() * c.element_size()
+        )
+        workspace_count = testing.get_workspace_count(
+            one_workspace_bytes, warmup_iterations, iterations
+        )
+
+    avg_time_us = testing.benchmark(
+        compiled_fn,
+        workspace_generator=generate_tensors,
+        workspace_count=workspace_count,
+        stream=current_stream,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+    )
+
+    # Print execution results
+    print(f"Kernel execution time: {avg_time_us / 1e3:.4f} ms")
+
+    return avg_time_us  # Return execution time in microseconds
 
 
 if __name__ == "__main__":
@@ -764,17 +838,29 @@ if __name__ == "__main__":
     parser.add_argument("--c_major", choices=["n", "m"], default="n")
     parser.add_argument("--warmup_iterations", default=2, type=int)
     parser.add_argument("--iterations", default=100, type=int)
+    parser.add_argument("--static_shape", action="store_true")
     parser.add_argument("--skip_ref_check", action="store_true")
+    parser.add_argument(
+        "--use_cold_l2",
+        action="store_true",
+        default=False,
+        help="Use circular buffer tensor sets to ensure L2 cold cache",
+    )
 
     args = parser.parse_args()
     print("Running SIMT GEMM example:")
-    main(
+
+    torch.manual_seed(1024)
+
+    run(
+        args.mnk,
         args.a_major,
         args.b_major,
         args.c_major,
-        args.mnk,
+        args.static_shape,
         args.warmup_iterations,
         args.iterations,
         args.skip_ref_check,
+        args.use_cold_l2,
     )
     print("PASS")

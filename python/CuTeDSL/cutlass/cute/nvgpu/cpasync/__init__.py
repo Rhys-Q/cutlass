@@ -23,10 +23,11 @@ __all__ = [
     "CopyBulkTensorTileG2SOp",
     "CopyBulkTensorTileG2SMulticastOp",
     "CopyBulkTensorTileS2GOp",
+    "CopyReduceBulkTensorTileS2GOp",
     #
     # helpers.py
     #
-    "make_tma_tile_atom",
+    "make_tiled_tma_atom",
     "tma_partition",
     "create_tma_multicast_mask",
     "prefetch_descriptor",

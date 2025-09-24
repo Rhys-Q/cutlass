@@ -20,7 +20,8 @@ from typing import Union
 from cutlass._mlir import ir
 import cutlass._mlir.dialects.cute as _cute_ir
 
-from cutlass.cutlass_dsl import TensorFormat, JitArgAdapterRegistry
+from cutlass.base_dsl.dsl import is_dynamic_expression
+from cutlass.cutlass_dsl import JitArgAdapterRegistry
 
 # Local modules imports
 from .typing import (
@@ -45,7 +46,8 @@ from .typing import (
     BFloat16,
     Float8E5M2,
 )
-from .core import find, _Tensor as CoreTensor
+from . import core
+from .core import _Tensor as CoreTensor
 
 
 class _Pointer(Pointer):
@@ -80,41 +82,35 @@ class _Pointer(Pointer):
         self._dtype = dtype
         self._addr_space = mem_space
 
-        is_in_device = mem_space == _cute_ir.AddressSpace.gmem
         if assumed_align is None:
-            if is_in_device:
-                self._assumed_align = 32
-            else:
-                self._assumed_align = dtype.width // 8
+            self._assumed_align = dtype.width // 8
         else:
             self._assumed_align = assumed_align
 
-        class PtrDescriptor(ctypes.Structure):
-            """A ctype descriptor for CuTe memref ptr"""
-
-            _fields_ = [("ptr", ctypes.c_void_p)]
-
-            def __str__(self):
-                return f"0x{self.ptr:016x}"
-
-        self._desc = PtrDescriptor(int(self._pointer))
-        self._c_pointer = ctypes.cast(ctypes.pointer(self._desc), ctypes.c_void_p)
+        self._c_pointer = None
         assert (
-            self._desc.ptr % self._assumed_align == 0
+            int(self._pointer) % self._assumed_align == 0
         ), f"pointer must be {self._assumed_align} bytes aligned"
 
     def size_in_bytes(self) -> int:
+        self._desc = ctypes.c_void_p(int(self._pointer))
         return ctypes.sizeof(self._desc)
 
     def __get_mlir_types__(self):
         return [self.mlir_type]
 
     def __c_pointers__(self):
+        if self._c_pointer is None:
+            self._desc = ctypes.c_void_p(int(self._pointer))
+            self._c_pointer = ctypes.addressof(self._desc)
         return [self._c_pointer]
 
     def __new_from_mlir_values__(self, values):
         assert len(values) == 1
         return values[0]
+
+    def __extract_mlir_values__(self):
+        return [self._c_pointer]
 
     # Move mlir Type out of __init__ to decouple with mlir Context
     @property
@@ -131,6 +127,9 @@ class _Pointer(Pointer):
     def memspace(self):
         return self._addr_space
 
+    def align(self, min_align: int, *, loc=None, ip=None) -> Pointer:
+        raise NotImplementedError("align is not supported in runtime")
+
     def verify(self, expected_py_type):
         if expected_py_type is Pointer:
             return True
@@ -140,7 +139,7 @@ class _Pointer(Pointer):
         return False
 
     def __str__(self) -> str:
-        return f"Ptr<0x{self._desc.ptr:016x}@{self._addr_space}>"
+        return f"Ptr<0x{int(self._pointer):016x}@{self._addr_space}>"
 
     def __repr__(self):
         return self.__str__()
@@ -361,7 +360,7 @@ class _Tensor(Tensor):
         * If nested leading dimensions are found, returns a tuple of indices
         * If no leading dimension is found, returns None
         """
-        return find(1, self.stride, exclude_when=(1, self.shape))
+        return core.leading_dim(self.shape, self.stride)
 
     def fill(self, value: Numeric):
         raise TypeError(f"fill function is not supported in runtime")
@@ -479,12 +478,8 @@ class TensorAdapter:
     Convert a DLPack protocol supported tensor/array to a cute tensor.
     """
 
-    # Need reference these capsules to avoid being garbage collected
-    tensor_capsules = []
-
     def __init__(self, arg):
         self._arg = from_dlpack(arg).mark_layout_dynamic()
-        self.tensor_capsules.append(self._arg)
 
     def __new_from_mlir_values__(self, values):
         return self._arg.__new_from_mlir_values__(values)

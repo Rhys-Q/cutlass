@@ -51,7 +51,7 @@ namespace cutlass {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Floating-point rounding style similare to Standard Library's formats but supporting
+/// Floating-point rounding style similar to Standard Library's formats but supporting
 /// additional rounding options.
 enum class FloatRoundStyle {
   round_indeterminate,          ///< rounding mode unknown
@@ -3901,16 +3901,16 @@ struct NumericArrayConverter<float_e2m1_t, float, 4, Round> {
   static result_type convert(source_type const & source) {
 
   #if defined(CUDA_PTX_FP4FP6_CVT_ENABLED)
-    unsigned out;
+    uint16_t out;
     asm volatile( \
       "{\n" \
       ".reg .b8 byte0;\n" \
       ".reg .b8 byte1;\n" \
       "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n" \
       "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n" \
-      "mov.b32 %0, {byte0, byte1, 0, 0};\n" \
+      "mov.b16 %0, {byte0, byte1};\n" \
       "}" \
-      : "=r"(out) : "f"(source[0]), "f"(source[1]), "f"(source[2]), "f"(source[3]));
+      : "=h"(out) : "f"(source[0]), "f"(source[1]), "f"(source[2]), "f"(source[3]));
 
     return reinterpret_cast<result_type const &>(out);
   #else
@@ -6175,7 +6175,7 @@ private:
       asm volatile("prmt.b32 %0,%1,%1,%2;\n" : "=r"(r[ii]) : "r"(src_reg), "r"(prmt_indices[ii]));
     }
 
-    // In the absense of add.s16x2 instruction, use bit-wise operation to execute signed addition with magic numbers to achieve
+    // In the absence of add.s16x2 instruction, use bit-wise operation to execute signed addition with magic numbers to achieve
     // the same result as add.s16x2 instruction.
     // (See https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#logic-and-shift-instructions-lop3)
     // For a logical operation F(a, b, c) the value of kImmLut can be computed by applying the same operation to

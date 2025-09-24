@@ -12,6 +12,8 @@
 from enum import Enum
 from math import log2, ceil
 from typing import List, Type, Union, Tuple
+from typing_extensions import deprecated
+import warnings
 
 from cutlass.cutlass_dsl import (
     Float16,
@@ -22,6 +24,7 @@ from cutlass.cutlass_dsl import (
     Int8,
     Float8E4M3FN,
     Float8E5M2,
+    Float4E2M1FN,
     Numeric,
     NumericMeta,
     dsl_user_op,
@@ -34,6 +37,9 @@ from cutlass.cute.nvgpu.tcgen05 import (
     MmaTF32Op,
     MmaI8Op,
     MmaFP8Op,
+    MmaMXF8Op,
+    MmaMXF4Op,
+    MmaMXF4NVF4Op,
     OperandSource,
     OperandMajorMode,
     CtaGroup,
@@ -51,7 +57,30 @@ from cutlass.cute.nvgpu.tcgen05 import (
     is_tmem_load,
     get_tmem_copy_properties,
 )
+from cutlass.cute.nvgpu.cpasync import (
+    CopyBulkTensorTileG2SMulticastOp,
+    CopyBulkTensorTileG2SOp,
+)
 from cutlass.utils.layout import LayoutEnum
+
+
+@deprecated("Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead")
+class SmemCapacity(Enum):
+    SM100_SMEM_CAPACITY_BYTES = (228 - 1) * 1024
+    SM120_SMEM_CAPACITY_BYTES = (100 - 1) * 1024
+
+
+warnings.warn(
+    "SMEM_CAPACITY is deprecated: Use get_smem_capacity_in_bytes from cutlass.utils.smem_capacity instead",
+    DeprecationWarning,
+    stacklevel=2,
+)
+# Dictionary to map compute capability to SMEM capacity
+SMEM_CAPACITY = {
+    "sm100": SmemCapacity.SM100_SMEM_CAPACITY_BYTES.value,
+    "sm120": SmemCapacity.SM120_SMEM_CAPACITY_BYTES.value,
+}
+
 
 @dsl_user_op
 def compute_epilogue_tile_shape(
@@ -716,6 +745,7 @@ def make_smem_layout_b(
 
     return b_smem_layout_staged
 
+
 @dsl_user_op
 def get_smem_layout_atom_epi(
     layout: LayoutEnum,
@@ -816,17 +846,6 @@ def make_smem_layout_epi(
     return epi_smem_layout_staged
 
 
-class SmemCapacity(Enum):
-    SM100_SMEM_CAPACITY_BYTES = (228 - 1) * 1024
-    SM120_SMEM_CAPACITY_BYTES = (100 - 1) * 1024
-
-
-# Dictionary to map compute capability to SMEM capacity
-SMEM_CAPACITY = {
-    "sm100": SmemCapacity.SM100_SMEM_CAPACITY_BYTES.value,
-    "sm120": SmemCapacity.SM120_SMEM_CAPACITY_BYTES.value,
-}
-
 @dsl_user_op
 def make_trivial_tiled_mma(
     ab_dtype: Type[Numeric],
@@ -908,3 +927,209 @@ def make_trivial_tiled_mma(
         raise TypeError(f"unsupported ab_dtype, got {ab_dtype}")
 
     return cute.make_tiled_mma(cute.make_mma_atom(mma_op))
+
+
+@dsl_user_op
+def make_blockscaled_trivial_tiled_mma(
+    ab_dtype: Type[Numeric],
+    a_leading_mode: OperandMajorMode,
+    b_leading_mode: OperandMajorMode,
+    sf_dtype: Type[Numeric],
+    sf_vec_size: int,
+    cta_group: CtaGroup,
+    mma_tiler_mn: Tuple[int, int],
+    a_source: OperandSource = OperandSource.SMEM,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.TiledMma:
+    """Make a BlockScaled tiled MMA atom with given data type, leading dimension, cta group and mma tile shape.
+    By default, the MMA atom is created with SMEM operand source for A.
+
+    :param ab_dtype: Data type of operands A and B.
+    :type ab_dtype: type[Numeric]
+    :param a_leading_mode: Leading dimension of operand A (1 for K, 0 for M/N).
+    :type a_leading_mode: tcgen05.OperandMajorMode
+    :param b_leading_mode: Leading dimension of operand B (1 for K, 0 for M/N).
+    :type b_leading_mode: tcgen05.OperandMajorMode
+    :param sf_dtype: Data type of the Scale Factor.
+    :type sf_dtype: type[Numeric]
+    :param sf_vec_size: The vector size of the Scale Factor.
+    :type sf_vec_size: int
+    :param cta_group: The CTA group to use.
+    :type cta_group: tcgen05.CtaGroup
+    :param mma_tiler_mn: The shape (M, N, K) of the MMA tiler.
+    :type mma_tiler_mn: Tuple[int, int]
+    :param a_source: The source of operand A (SMEM by default or TMEM).
+    :type a_source: OperandSource
+
+    :return: A tiled MMA atom.
+    :rtype: cute.TiledMma
+
+    :raises TypeError: If the data type is not supported.
+    """
+    if ab_dtype in {Float8E4M3FN, Float8E5M2}:
+        mma_op = MmaMXF8Op(
+            ab_dtype,
+            (*mma_tiler_mn, 32),
+            cta_group,
+            a_source,
+            a_leading_mode,
+            b_leading_mode,
+        )
+    elif ab_dtype == Float4E2M1FN:
+        if sf_vec_size == 32:
+            mma_op = MmaMXF4Op(
+                (*mma_tiler_mn, 64),
+                cta_group,
+                a_source,
+            )
+        elif sf_vec_size == 16:
+            mma_op = MmaMXF4NVF4Op(
+                sf_dtype,
+                (*mma_tiler_mn, 64),
+                cta_group,
+                a_source,
+            )
+        else:
+            raise ValueError(f"unsupported sf_vec_size, got {sf_vec_size}")
+    else:
+        raise TypeError(f"unsupported ab_dtype, got {ab_dtype}")
+
+    return cute.make_tiled_mma(cute.make_mma_atom(mma_op))
+
+
+@dsl_user_op
+def cluster_shape_to_tma_atom_A(
+    cluster_shape_mnk: cute.Shape, atom_thr_id: cute.Layout, *, loc=None, ip=None
+) -> Union[CopyBulkTensorTileG2SMulticastOp, CopyBulkTensorTileG2SOp]:
+    """
+    Select the appropriate TMA copy atom for A based on the number of SMs and the multicast flag.
+
+    :param cluster_shape_mnk: The shape of the cluster
+    :type cluster_shape_mnk: cute.Shape
+    :param atom_thr_id: The thread ID of the atom
+    :type atom_thr_id: cute.Layout
+
+    :return: The appropriate TMA copy atom kind
+    :rtype: cpasync.CopyBulkTensorTileG2SMulticastOp or cpasync.CopyBulkTensorTileG2SOp
+
+    :raise ValueError: If the atom_sm_cnt is invalid
+    :raise ValueError: If the cluster shape is not divisible by the atom SM count
+    """
+    atom_sm_cnt = cute.size(atom_thr_id, loc=loc, ip=ip)
+    mcast = not (cute.size(cluster_shape_mnk, mode=[1], loc=loc, ip=ip) == 1)
+    cluster_size = cute.size(cluster_shape_mnk, loc=loc, ip=ip)
+
+    if not isinstance(cluster_size, int) or not isinstance(atom_sm_cnt, int):
+        raise ValueError(
+            f"Dynamic cluster shape or atom SM count is not supported: {cluster_shape_mnk} and {atom_thr_id}"
+        )
+
+    if cute.size(cluster_shape_mnk, mode=[0], loc=loc, ip=ip) % atom_sm_cnt != 0:
+        raise ValueError(
+            f"Cluster shape not divisible by MMA size: {cluster_shape_mnk} and {atom_thr_id}"
+        )
+
+    if atom_sm_cnt == 2 and mcast:
+        return CopyBulkTensorTileG2SMulticastOp(CtaGroup.TWO)
+    elif atom_sm_cnt == 2 and not mcast:
+        return CopyBulkTensorTileG2SOp(CtaGroup.TWO)
+    elif atom_sm_cnt == 1 and mcast:
+        return CopyBulkTensorTileG2SMulticastOp(CtaGroup.ONE)
+    elif atom_sm_cnt == 1 and not mcast:
+        return CopyBulkTensorTileG2SOp(CtaGroup.ONE)
+
+    raise ValueError(
+        f"Unsupported Configuration for SM100 TMA: {cluster_shape_mnk} and {atom_thr_id}"
+    )
+
+
+@dsl_user_op
+def cluster_shape_to_tma_atom_B(
+    cluster_shape_mnk: cute.Shape, atom_thr_id: cute.Layout, *, loc=None, ip=None
+) -> Union[CopyBulkTensorTileG2SMulticastOp, CopyBulkTensorTileG2SOp]:
+    """
+    Select the appropriate TMA copy atom for Bbased on the number of SMs and the multicast flag.
+
+    :param cluster_shape_mnk: The shape of the cluster
+    :type cluster_shape_mnk: cute.Shape
+    :param atom_thr_id: The thread ID of the atom
+    :type atom_thr_id: cute.Layout
+
+    :return: The appropriate TMA copy atom kind
+    :rtype: cpasync.CopyBulkTensorTileG2SMulticastOp or cpasync.CopyBulkTensorTileG2SOp
+
+    :raise ValueError: If the atom_sm_cnt is invalid
+    :raise ValueError: If the cluster shape is not divisible by the atom SM count
+    """
+    atom_sm_cnt = cute.size(atom_thr_id, loc=loc, ip=ip)
+    mcast = not (cute.size(cluster_shape_mnk, mode=[0], loc=loc, ip=ip) == atom_sm_cnt)
+    cluster_size = cute.size(cluster_shape_mnk, loc=loc, ip=ip)
+
+    if not isinstance(cluster_size, int) or not isinstance(atom_sm_cnt, int):
+        raise ValueError(
+            f"Dynamic cluster shape or atom SM count is not supported: {cluster_shape_mnk} and {atom_thr_id}"
+        )
+
+    if cute.size(cluster_shape_mnk, mode=[0], loc=loc, ip=ip) % atom_sm_cnt != 0:
+        raise ValueError(
+            f"Cluster shape not divisible by MMA size: {cluster_shape_mnk} and {atom_thr_id}"
+        )
+
+    if atom_sm_cnt == 2 and mcast:
+        return CopyBulkTensorTileG2SMulticastOp(CtaGroup.TWO)
+    elif atom_sm_cnt == 2 and not mcast:
+        return CopyBulkTensorTileG2SOp(CtaGroup.TWO)
+    elif atom_sm_cnt == 1 and mcast:
+        return CopyBulkTensorTileG2SMulticastOp(CtaGroup.ONE)
+    elif atom_sm_cnt == 1 and not mcast:
+        return CopyBulkTensorTileG2SOp(CtaGroup.ONE)
+
+    raise ValueError(
+        f"Unsupported Configuration for SM100 TMA: {cluster_shape_mnk} and {atom_thr_id}"
+    )
+
+
+@dsl_user_op
+def cluster_shape_to_tma_atom_SFB(
+    cluster_shape_mnk: cute.Shape, atom_thr_id: cute.Layout, *, loc=None, ip=None
+) -> Union[CopyBulkTensorTileG2SMulticastOp, CopyBulkTensorTileG2SOp]:
+    """
+    Select the appropriate TMA copy atom for SFB based on the number of SMs and the multicast flag.
+
+    :param cluster_shape_mnk: The shape of the cluster
+    :type cluster_shape_mnk: cute.Shape
+    :param atom_thr_id: The thread ID of the atom
+    :type atom_thr_id: cute.Layout
+
+    :return: The appropriate TMA copy atom kind
+    :rtype: cpasync.CopyBulkTensorTileG2SMulticastOp or cpasync.CopyBulkTensorTileG2SOp
+
+    :raise ValueError: If the atom_sm_cnt is invalid
+    :raise ValueError: If the cluster shape is not divisible by the atom SM count
+    """
+    atom_sm_cnt = cute.size(atom_thr_id, loc=loc, ip=ip)
+    mcast = not (cute.size(cluster_shape_mnk, mode=[0], loc=loc, ip=ip) == 1)
+    cluster_size = cute.size(cluster_shape_mnk, loc=loc, ip=ip)
+
+    if not isinstance(cluster_size, int) or not isinstance(atom_sm_cnt, int):
+        raise ValueError(
+            f"Dynamic cluster shape or atom SM count is not supported: {cluster_shape_mnk} and {atom_thr_id}"
+        )
+
+    if cute.size(cluster_shape_mnk, mode=[0], loc=loc, ip=ip) % atom_sm_cnt != 0:
+        raise ValueError(
+            f"Cluster shape not divisible by MMA size: {cluster_shape_mnk} and {atom_thr_id}"
+        )
+
+    if atom_sm_cnt == 2:
+        return CopyBulkTensorTileG2SMulticastOp(CtaGroup.TWO)
+    elif atom_sm_cnt == 1 and mcast:
+        return CopyBulkTensorTileG2SMulticastOp(CtaGroup.ONE)
+    elif atom_sm_cnt == 1 and not mcast:
+        return CopyBulkTensorTileG2SOp(CtaGroup.ONE)
+
+    raise ValueError(
+        f"Unsupported Configuration for SM100 TMA: {cluster_shape_mnk} and {atom_thr_id}"
+    )

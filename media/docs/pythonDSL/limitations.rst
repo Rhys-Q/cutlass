@@ -18,7 +18,6 @@ Notable unsupported features
 ----------------------------
 
 - GeForce RTX 50 Series support
-- RS WGMMA (The input matrix A comes from register and the input matrix B comes from shared memory)
 - Programmatic Dependent Launch (PDL)
 - narrow-precision data type support, including related tensor core instructions
 - convolutions
@@ -30,6 +29,10 @@ Notable unsupported features
 
 Programming Model
 ---------------------
+
+**CuTe Layout Algebra Only support 32bit**
+    Today, we only support 32bit shapes/strides in CuTe layouts. 64bit or arbitrary 
+    width support is planned for future releases.
 
 **Python Native Data Types**
     CuTe DSL supports Python data structures when used for "meta-programming,"
@@ -51,6 +54,7 @@ Programming Model
         - Modifiable during execution of JIT-compiled functions
         - Only a specific subset of Python types are supported as dynamic values
         - Primitive types are automatically converted when passed as function arguments:
+        
           - ``int`` → ``Int32`` (may be updated to ``Int64`` in future releases)
           - ``bool`` → ``Bool``
           - ``float`` → ``Float32`` (may be updated to ``Float64`` in future releases)
@@ -74,7 +78,7 @@ Programming Model
                 # of the runtime value of `i`
                 xs.append(Float32(3.0))
 
-            for i in range_dynamic(10):
+            for i in range(10):
                 # This only append one element to the list at compile-time
                 # as loop doesn't unroll at compile-time
                 xs.append(Float32(1.0))
@@ -139,16 +143,29 @@ Programming Model
         @cute.jit
         def foo():
             a = Int32(1)
-            for i in range_dynamic(10):
+            for i in range(10):
                 a = Float32(2)  # Changing type inside loop-body is not allowed in the DSL
+
 
 **Built-in Operators**
     The DSL transforms built-in operators like ``and``, ``or``, ``max``, ``min``, etc.
     into MLIR operations. They also follow the same constraints of dependent types.
     For instance, ``a and b`` requires ``a`` and ``b`` to be of the same type.
 
-    Comparison like ``==`` on Sequence of dynamic values is known to not produce
-    expected result at runtime.
+
+**Special Variables**
+    The DSL treats ``_`` as a special variable that it's value is meant to be ignored.
+    It is not allowed to read ``_`` in the DSL.
+
+    Example illustrating functionality in Python that is not supported in the DSL:
+
+    .. code:: python
+
+        @cute.jit
+        def foo():
+            _ = 1
+            print(_)  # This is not allowed in the DSL
+
 
 **Object Oriented Programming**
     The DSL is implemented on top of Python and supports Python's object-oriented programming (OOP) features
@@ -176,7 +193,7 @@ Programming Model
         @cute.jit
         def foo(a: Int32, res: cute.Tensor):
             foo = Foo(a)
-            for i in cutlass.range_dynamic(10):
+            for i in range(10):
                 foo.set_a(i)
 
             # This fails to compile because `a` is assigned a local value defined within the for-loop body

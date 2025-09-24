@@ -126,6 +126,7 @@ struct Options {
   bool verbose = false;
 
   bool causal = false;
+  bool causal_q_begin = true;
   bool residual = false;
   bool varlen = false;
   bool persistent = false;
@@ -266,6 +267,8 @@ struct Options {
 
     std::string mask;
     cmd.get_cmd_line_argument<std::string>("mask", mask, "");
+    std::string causal_type;
+    cmd.get_cmd_line_argument<std::string>("causal-type", causal_type, "");
     if (mask == "no" || mask == "") {
       causal = residual = false;
       if (varlen) {
@@ -275,6 +278,11 @@ struct Options {
     else if (mask == "causal") {
       residual = false;
       causal = true;
+      if(causal_type == "qend") {
+        causal_q_begin = false;
+      } else {
+        causal_q_begin = true;
+      }
     }
     else if (mask == "residual") {
       residual = true;
@@ -313,6 +321,7 @@ struct Options {
       << "  --verify                    Verify results\n"
       << "  --verbose                   Print smem and execution time per kernel\n"
       << "  --mask=<no|residual|causal> Enables masking\n"
+      << "  --causal-type=<qbegin|qend> Causal mask type\n"
       << "  --persistent                Enables persistent scheduler\n"
       << "  --varlen                    Enables variable sequence length\n"
       << "                              B*Q and B*K become the total sequence length\n"
@@ -410,16 +419,16 @@ struct FwdRunner {
   using ElementAccumulatorPV = float;
   using ElementOut = cutlass::half_t;
 
-  // Q K D (B H)
+  // Q K D ((H_R, H_K) B)
   using ProblemShapeRegular = cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int>, int>>;
   using ProblemShapeVarlen = cute::tuple<VariableLength, VariableLength, int, cute::tuple<cute::tuple<int, int>, int>>;
   using ProblemShapeType = std::conditional_t<kIsVarlen, ProblemShapeVarlen, ProblemShapeRegular>;
   
-  using StrideQ = cute::tuple<int, _1, cute::tuple<cute::tuple<int, int>, int>>;  // Q D (H_G H_R B)
-  using StrideK = cute::tuple<int, _1, cute::tuple<cute::tuple<_0, int>, int>>;  // K D (H_G H_R B)
+  using StrideQ = cute::tuple<int, _1, cute::tuple<cute::tuple<int, int>, int>>;  // Q D ((H_R, H_K), B)
+  using StrideK = cute::tuple<int, _1, cute::tuple<cute::tuple<_0, int>, int>>;  // K D ((H_R, H_K), B)
   using StrideV = StrideK;
   using StrideO = StrideQ;
-  using StrideLSE = cute::tuple<_1, cute::tuple<cute::tuple<int, int>, int>>;     // Q   (H_G H_R B)
+  using StrideLSE = cute::tuple<_1, cute::tuple<cute::tuple<int, int>, int>>;     // Q ((H_R, H_K), B)
 
   static constexpr bool kIsPersistent = find_option_t<Tag::kIsPersistent, true_type, KernelOptions...>::value;
   using TileScheduler = std::conditional_t<kIsPersistent, cutlass::fmha::kernel::PersistentTileScheduler, cutlass::fmha::kernel::IndividualTileScheduler>;
@@ -505,8 +514,12 @@ struct FwdRunner {
     Tensor mLSE = make_tensor(make_gmem_ptr(buffer.block_ref_LSE.get()),
       select<0,3>(problem_shape),
       stride_LSE);
+    
+    auto [Q, K, D, HB] = problem_shape;
 
-    fmha_reference(problem_shape, mQ, mK, mV, mO, mLSE, ActiveMask{});
+    auto problem_shape_ref = cute::make_tuple(Q, K, D, D, HB);
+
+    fmha_reference(problem_shape_ref, mQ, mK, mV, mO, mLSE, ActiveMask{});
 
     cudaError_t result = cudaDeviceSynchronize();
     if (result != cudaSuccess) {
@@ -598,8 +611,8 @@ struct FwdRunner {
 
     ProblemShapeType problem_size_for_launch;
 
-    get<0>(problem_size_for_launch) = VariableLength{max_seqlen_q};
-    get<1>(problem_size_for_launch) = VariableLength{max_seqlen_kv};
+    get<0>(problem_size_for_launch) = VariableLength{max_seqlen_q, nullptr, total_seqlen_q};
+    get<1>(problem_size_for_launch) = VariableLength{max_seqlen_kv, nullptr, total_seqlen_kv};
     get<2>(problem_size_for_launch) = get<2>(problem_size);
     get<3>(problem_size_for_launch) = get<3>(problem_size);
 
@@ -656,9 +669,9 @@ struct FwdRunner {
     }
 
     auto buffer_init_fn = [&](auto& buffer) {
-      buffer.block_Q.reset(size(shape_QO), kIsVarlen ? D*SQ*H : 0);
-      buffer.block_K.reset(size(shape_KV), kIsVarlen ? D*SK*H_K : 0);
-      buffer.block_V.reset(size(shape_KV), kIsVarlen ? D*SK*H_K : 0);
+      buffer.block_Q.reset(size(shape_QO));
+      buffer.block_K.reset(size(shape_KV));
+      buffer.block_V.reset(size(shape_KV));
       buffer.block_O.reset(size(shape_QO), kIsVarlen ? D*SQ*H : 0);
       buffer.block_LSE.reset(size(shape_LSE));
       buffer.block_ref_O.reset(size(shape_QO), kIsVarlen ? D*SQ*H : 0);
@@ -853,7 +866,7 @@ struct FwdRunner {
       flops *= static_cast<double>(size<1>(problem_shape));
       flops *= static_cast<double>(size<3,1>(problem_shape));
     }
-    flops *= 4.0 * (std::is_same_v<ActiveMask, CausalMask> ? 0.5 : 1.0);
+    flops *= 4.0 * (std::is_same_v<ActiveMask, CausalMask<true>> || std::is_same_v<ActiveMask, CausalMask<false>> ? 0.5 : 1.0);
     flops *= static_cast<double>(size<2>(problem_shape));
     flops *= static_cast<double>(size<3,0>(problem_shape));
     double tflops_s = flops * 1e-12 /*tera*/ / (runtime_ms * 1e-3 /*ms*/);
@@ -888,11 +901,18 @@ struct FwdRunner {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+int main_result = 0;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
 /// Helper to print a description of the example run and its result
 void print_result(const std::string& description, ExampleResult result, bool verbose) {
   std::ios fmt(nullptr);
   fmt.copyfmt(std::cout);
   std::cout << (result.passed ? (result.verified ? " [OK]  " : " [--] ") : "[FAIL] ");
+  if (! result.passed) {
+    main_result = -1;
+  }
   std::cout << std::setw(32) << std::left << description;
   std::cout.copyfmt(fmt);
   std::cout << " : " << result.tflops_tc_s << " TFLOPS/s" << std::endl;
@@ -1067,7 +1087,11 @@ int main_single(int argc, char const **args) {
 
   auto with_mask = [&](auto fn) {
     if (options.causal) {
-      fn(CausalMask{});
+      if(options.causal_q_begin) {
+        fn(CausalMask{});
+      } else {
+        fn(CausalMask<false>{});
+      }
     }
     else if (options.residual) {
       fn(ResidualMask{});
@@ -1093,15 +1117,13 @@ int main_single(int argc, char const **args) {
   });
 #endif
 
-  return 0;
+  return main_result;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 int main(int argc, char const **args) {
   std::vector<std::string> full_arguments(args, args + argc);
-
-  int result = 0;
 
   bool recursed = false;
   for (size_t i = 1; i < full_arguments.size(); i++) {
@@ -1129,7 +1151,7 @@ int main(int argc, char const **args) {
     main_single(argc, args);
   }
 
-  return result;
+  return main_result;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

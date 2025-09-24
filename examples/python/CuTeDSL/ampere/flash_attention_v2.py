@@ -32,13 +32,13 @@ from typing import Type, Union, Callable
 
 import torch
 import cuda.bindings.driver as cuda
-
+import cutlass.cute.testing as testing
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
-import cutlass.utils.ampere_helpers as sm80_utils
+import cutlass.utils as utils
 
 """
 A flash attention v2 forward pass example for NVIDIA Ampere SM80 architecture using CUTE DSL.
@@ -163,7 +163,7 @@ class FlashAttentionForwardAmpere:
         # Check if block size setting is out of shared memory capacity
         # Shared memory usage: Q tile + (K tile + V tile) where K and V use the same tile size
         smem_usage = (m_block_size * head_dim + n_block_size * head_dim * 2) * 2
-        smem_capacity = sm80_utils.SMEM_CAPACITY["sm80"]
+        smem_capacity = utils.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
 
@@ -327,7 +327,6 @@ class FlashAttentionForwardAmpere:
         ).launch(
             grid=grid_dim,
             block=[self._num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
         )
 
@@ -469,21 +468,9 @@ class FlashAttentionForwardAmpere:
             warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
             self._dtype,
         )
-        smem_tiled_copy_Q = cute.make_tiled_copy(
-            smem_copy_atom_Q,
-            layout_tv=tiled_mma.tv_layout_A_tiled,
-            tiler_mn=(tiled_mma.get_tile_size(0), tiled_mma.get_tile_size(2)),
-        )
-        smem_tiled_copy_K = cute.make_tiled_copy(
-            smem_copy_atom_K,
-            layout_tv=tiled_mma.tv_layout_B_tiled,
-            tiler_mn=(tiled_mma.get_tile_size(1), tiled_mma.get_tile_size(2)),
-        )
-        smem_tiled_copy_V = cute.make_tiled_copy(
-            smem_copy_atom_V,
-            layout_tv=tiled_mma.tv_layout_B_tiled,
-            tiler_mn=(tiled_mma.get_tile_size(1), tiled_mma.get_tile_size(2)),
-        )
+        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_Q, tiled_mma)
+        smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_K, tiled_mma)
+        smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom_V, tiled_mma)
 
         smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
         smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
@@ -542,13 +529,13 @@ class FlashAttentionForwardAmpere:
             cutlass.Boolean,
         )
         # Set predicates for head_dim bounds, seqlen_q/k bounds is processed at the first tile.
-        for rest_v in range(tQpQ.shape[0]):
-            for rest_k in range(tQpQ.shape[2]):
+        for rest_v in cutlass.range_constexpr(tQpQ.shape[0]):
+            for rest_k in cutlass.range_constexpr(tQpQ.shape[2]):
                 tQpQ[rest_v, 0, rest_k] = cute.elem_less(
                     tQcQ[(0, rest_v), 0, rest_k][3], mQ.layout.shape[3]
                 )
-        for rest_v in range(tKVpKV.shape[0]):
-            for rest_k in range(tKVpKV.shape[2]):
+        for rest_v in cutlass.range_constexpr(tKVpKV.shape[0]):
+            for rest_k in cutlass.range_constexpr(tKVpKV.shape[2]):
                 tKVpKV[rest_v, 0, rest_k] = cute.elem_less(
                     tKVcKV[(0, rest_v), 0, rest_k][3], mK.layout.shape[3]
                 )
@@ -556,7 +543,7 @@ class FlashAttentionForwardAmpere:
         # Prefetch Prologue
         # ///////////////////////////////////////////////////////////////////////////////
         # Start async loads of the last mn-tile, where we take care of the mn residue
-        for m in range(cute.size(tQsQ.shape[1])):
+        for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             if cute.elem_less(tQcQ[0, m, 0][1], mQ.layout.shape[1]):
                 cute.copy(
                     gmem_tiled_copy_QKV,
@@ -567,7 +554,7 @@ class FlashAttentionForwardAmpere:
             else:
                 # Clear the smem tiles to account for predicated off loads
                 tQsQ[None, m, None].fill(0)
-        for n in range(cute.size(tKsK.shape[1])):
+        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
             if cute.elem_less(tKVcKV[0, n, 0][1], mK.layout.shape[1]):
                 cute.copy(
                     gmem_tiled_copy_QKV,
@@ -644,13 +631,13 @@ class FlashAttentionForwardAmpere:
         # We also need masking on S if it's causal, for the last ceil_div(m_block_size, n_block_size) blocks.
         # We will have at least 1 "masking" iteration.
         mask_steps = 1
-        if self._is_causal:
+        if cutlass.const_expr(self._is_causal):
             mask_steps = cute.ceil_div(self._m_block_size, self._n_block_size)
 
-        for n_tile in range(mask_steps):
+        for n_tile in cutlass.range_constexpr(mask_steps):
             n_block = n_block_max - n_tile - 1
             basic_params.n_block = n_block
-            if self._is_causal:
+            if cutlass.const_expr(self._is_causal):
                 if n_block >= 0:
                     self.compute_one_n_block(
                         basic_params,
@@ -673,7 +660,7 @@ class FlashAttentionForwardAmpere:
                 )
 
         # Start async loads of rest k-tiles in reverse order, no k-residue handling needed
-        for n_tile in cutlass.range_dynamic(mask_steps, n_block_max, 1):
+        for n_tile in range(mask_steps, n_block_max, 1):
             n_block = n_block_max - n_tile - 1
             basic_params.n_block = n_block
             self.compute_one_n_block(
@@ -702,11 +689,7 @@ class FlashAttentionForwardAmpere:
             cute.nvgpu.CopyUniversalOp(), self._dtype
         )
         # tiled copy atom for O
-        smem_tiled_copy_O = cute.make_tiled_copy(
-            smem_copy_atom_O,
-            layout_tv=tiled_mma.tv_layout_C_tiled,
-            tiler_mn=(tiled_mma.get_tile_size(0), tiled_mma.get_tile_size(1)),
-        )
+        smem_tiled_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma)
         smem_thr_copy_O = smem_tiled_copy_O.get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
@@ -748,13 +731,13 @@ class FlashAttentionForwardAmpere:
             ),
             cutlass.Boolean,
         )
-        for rest_v in range(tOpO.shape[0]):
-            for rest_n in range(cute.size(tOpO.shape[2])):
+        for rest_v in cutlass.range_constexpr(tOpO.shape[0]):
+            for rest_n in cutlass.range_constexpr(cute.size(tOpO.shape[2])):
                 tOpO[rest_v, 0, rest_n] = cute.elem_less(
                     tOcO[(0, rest_v), 0, rest_n][3], mO.layout.shape[3]
                 )
         # copy acc O from rmem to gmem
-        for rest_m in range(cute.size(tOpO.shape[1])):
+        for rest_m in cutlass.range_constexpr(cute.size(tOpO.shape[1])):
             if cute.elem_less(tOcO[0, rest_m, 0][1], mO.layout.shape[1]):
                 cute.copy(
                     gmem_tiled_copy_O,
@@ -804,7 +787,7 @@ class FlashAttentionForwardAmpere:
         # load smem tile V for O, special process for the first tile to avoid loading nan.
         # The `if` here is a constexpr, won't be generated in the IR.
         if is_first_n_block:
-            for n in range(cute.size(gmem_copy_params.tVsV.shape[1])):
+            for n in cutlass.range_constexpr(cute.size(gmem_copy_params.tVsV.shape[1])):
                 if cute.elem_less(
                     gmem_copy_params.tKVcKV[0, n, 0][1],
                     basic_params.mK.layout.shape[1],
@@ -841,7 +824,7 @@ class FlashAttentionForwardAmpere:
             smem_copy_params.tSrK_copy_view[None, None, 0],
         )
         # mma for S
-        for k in range(cute.size(smem_copy_params.tSsQ.shape[2])):
+        for k in cutlass.range_constexpr(cute.size(smem_copy_params.tSsQ.shape[2])):
             # load next QK k-block from smem to rmem for mma
             k_next = (k + 1) % cute.size(smem_copy_params.tSsQ.shape[2])
             cute.copy(
@@ -916,7 +899,7 @@ class FlashAttentionForwardAmpere:
             smem_copy_params.tOrVt_copy_view[None, None, 0],
         )
         # mma for O
-        for k in range(cute.size(tOrS.shape[2])):
+        for k in cutlass.range_constexpr(cute.size(tOrS.shape[2])):
             # load next V k-block from smem to rmem for mma
             k_next = (k + 1) % cute.size(tOrS.shape[2])
             cute.copy(
@@ -965,14 +948,14 @@ class FlashAttentionForwardAmpere:
         acc_O_mn = self._make_acc_tensor_mn_view(mma_params.acc_O)
         row_max_prev = None
         # if it is not the first tile, load the row r of previous row_max and compare with row_max_cur_row.
-        if not is_first_n_block:
+        if cutlass.const_expr(not is_first_n_block):
             row_max_prev = cute.make_fragment_like(
                 softmax_params.row_max, cutlass.Float32
             )
             cute.basic_copy(softmax_params.row_max, row_max_prev)
         # if it is the first tile, create a mask for residual of S to -inf for softmax.
         tScS_mn = None
-        if in_mask_steps:
+        if cutlass.const_expr(in_mask_steps):
             mcS = cute.make_identity_tensor(
                 (
                     basic_params.mQ.shape[0],
@@ -990,12 +973,12 @@ class FlashAttentionForwardAmpere:
             tScS_mn = self._make_acc_tensor_mn_view(tScS)
 
         # Each iteration processes one row of acc_S
-        for r in range(cute.size(softmax_params.row_max)):
+        for r in cutlass.range_constexpr(cute.size(softmax_params.row_max)):
             # mask residual of S with -inf
-            if in_mask_steps:
-                if not self._is_causal:
+            if cutlass.const_expr(in_mask_steps):
+                if cutlass.const_expr(not self._is_causal):
                     # traverse column index.
-                    for c in range(cute.size(tScS_mn.shape[1])):
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                         if cute.elem_less(
                             basic_params.mK.shape[1], tScS_mn[0, c][3] + 1
                         ):
@@ -1006,7 +989,7 @@ class FlashAttentionForwardAmpere:
                         tScS_mn[r, 0][1] + 1, basic_params.mK.shape[1]
                     )
                     # traverse column index.
-                    for c in range(cute.size(tScS_mn.shape[1])):
+                    for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
                         # only consider the column index, so the row index sets to 0.
                         if cute.elem_less(col_idx_limit, tScS_mn[0, c][3] + 1):
                             acc_S_mn[r, c] = -cutlass.Float32.inf
@@ -1021,32 +1004,30 @@ class FlashAttentionForwardAmpere:
             row_max_cur_row = self._threadquad_reduce_max(row_max_cur_row)
             row_max_prev_row = None
             # if it is not the first tile, load the row r of previous row_max and compare with row_max_cur_row.
-            if not is_first_n_block:
+            if cutlass.const_expr(not is_first_n_block):
                 row_max_prev_row = row_max_prev[r]
                 row_max_cur_row = cute.arch.fmax(row_max_prev_row, row_max_cur_row)
-            if self._is_causal:
+            if cutlass.const_expr(self._is_causal):
                 row_max_cur_row = (
                     0.0 if row_max_cur_row == -cutlass.Float32.inf else row_max_cur_row
                 )
 
             # compute exp(x - max) using exp2(x * log_2(e) - max * log_2(e))
-            acc_S_row_exp = cute.TensorSSA(
-                self._exp2f(
-                    acc_S_row * softmax_params.softmax_scale_log2
-                    - row_max_cur_row * softmax_params.softmax_scale_log2
-                ),
-                tuple(acc_S_row.shape),
-                cutlass.Float32,
+            acc_S_row_exp = cute.math.exp2(
+                acc_S_row * softmax_params.softmax_scale_log2
+                - row_max_cur_row * softmax_params.softmax_scale_log2,
+                fastmath=True,
             )
             # acc_S_row_sum => f32
             acc_S_row_sum = acc_S_row_exp.reduce(
                 cute.ReductionOp.ADD, cutlass.Float32.zero, 0
             )
             # if it is not the first tile, load the row r of previous row_max and minus row_max_cur_row to update row_sum.
-            if not is_first_n_block:
-                prev_minus_cur_exp = self._exp2f(
+            if cutlass.const_expr(not is_first_n_block):
+                prev_minus_cur_exp = cute.math.exp2(
                     row_max_prev_row * softmax_params.softmax_scale_log2
-                    - row_max_cur_row * softmax_params.softmax_scale_log2
+                    - row_max_cur_row * softmax_params.softmax_scale_log2,
+                    fastmath=True,
                 )
                 acc_S_row_sum = (
                     acc_S_row_sum + softmax_params.row_sum[r] * prev_minus_cur_exp
@@ -1072,7 +1053,7 @@ class FlashAttentionForwardAmpere:
         """
         # do quad reduction for row_sum.
         acc_O_mn = self._make_acc_tensor_mn_view(acc_O)
-        for r in range(cute.size(row_sum)):
+        for r in cutlass.range_constexpr(cute.size(row_sum)):
             row_sum[r] = self._threadquad_reduce_sum(row_sum[r])
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
@@ -1157,28 +1138,8 @@ class FlashAttentionForwardAmpere:
         """
         return self._threadquad_reduce(val, lambda x, y: x + y)
 
-    def _exp2f(
-        self, x: Union[cute.TensorSSA, cutlass.Float32]
-    ) -> Union[cute.TensorSSA, cutlass.Float32]:
-        """exp2f calculation for both vector and scalar.
 
-        :param x: input value
-        :type x: cute.TensorSSA or cutlass.Float32
-        :return: exp2 value
-        :rtype: cute.TensorSSA or cutlass.Float32
-        """
-        if isinstance(x, cute.TensorSSA):
-            res = cute.make_fragment(x.shape, cutlass.Float32)
-            res.store(x)
-
-            for i in range(cute.size(x.shape)):
-                res[i] = self._exp2f(res[i])
-
-            return res.load()
-        return cute.arch.exp2(x)
-
-
-def run_flash_attention_fwd(
+def run(
     dtype: Type[cutlass.Numeric],
     batch_size: int,
     seqlen_q: int,
@@ -1193,6 +1154,8 @@ def run_flash_attention_fwd(
     warmup_iterations: int = 0,
     iterations: int = 1,
     skip_ref_check: bool = False,
+    use_cold_l2: bool = False,
+    **kwargs,
 ):
     # Skip unsupported testcase
     if not FlashAttentionForwardAmpere.can_implement(
@@ -1207,6 +1170,23 @@ def run_flash_attention_fwd(
             f"Unsupported testcase {dtype}, {head_dim}, {m_block_size}, {n_block_size}, {num_threads}, {is_causal}"
         )
 
+    print(f"Running Ampere SM80 FlashAttentionForward test with:")
+    print(f"  dtype: {dtype}")
+    print(f"  batch_size: {batch_size}")
+    print(f"  seqlen_q: {seqlen_q}")
+    print(f"  seqlen_k: {seqlen_k}")
+    print(f"  num_head: {num_head}")
+    print(f"  head_dim: {head_dim}")
+    print(f"  softmax_scale: {softmax_scale}")
+    print(f"  m_block_size: {m_block_size}")
+    print(f"  n_block_size: {n_block_size}")
+    print(f"  num_threads: {num_threads}")
+    print(f"  is_causal: {is_causal}")
+    print(f"  warmup_iterations: {warmup_iterations}")
+    print(f"  iterations: {iterations}")
+    print(f"  skip_ref_check: {skip_ref_check}")
+    print(f"  use_cold_l2: {use_cold_l2}")
+
     # Create tensor Q/K/V/O
     def create_tensor(
         batch_size: int,
@@ -1217,22 +1197,28 @@ def run_flash_attention_fwd(
     ) -> cute.Tensor:
         # (batch_size, seqlen, num_head, head_dim)
         shape = (batch_size, seqlen, num_head, head_dim)
-        return (
-            torch.empty(*shape, dtype=torch.int32).random_(-2, 2).to(dtype=dtype).cuda()
+        torch_tensor = (
+            torch.empty(*shape, dtype=torch.int32)
+            .random_(-2, 2)
+            .to(dtype=cutlass_torch.dtype(dtype))
+            .cuda()
         )
+        # assume input is 16B aligned.
+        cute_tensor = (
+            from_dlpack(torch_tensor, assumed_align=16)
+            .mark_layout_dynamic(leading_dim=3)
+            .mark_compact_shape_dynamic(
+                mode=3,
+                stride_order=torch_tensor.dim_order(),
+                divisibility=(128 // dtype.width),
+            )
+        )
+        return cute_tensor, torch_tensor
 
-    q = create_tensor(
-        batch_size, seqlen_q, num_head, head_dim, cutlass_torch.dtype(dtype)
-    )
-    k = create_tensor(
-        batch_size, seqlen_k, num_head, head_dim, cutlass_torch.dtype(dtype)
-    )
-    v = create_tensor(
-        batch_size, seqlen_k, num_head, head_dim, cutlass_torch.dtype(dtype)
-    )
-    o = create_tensor(
-        batch_size, seqlen_q, num_head, head_dim, cutlass_torch.dtype(dtype)
-    )
+    q, q_torch = create_tensor(batch_size, seqlen_q, num_head, head_dim, dtype)
+    k, k_torch = create_tensor(batch_size, seqlen_k, num_head, head_dim, dtype)
+    v, v_torch = create_tensor(batch_size, seqlen_k, num_head, head_dim, dtype)
+    o, o_torch = create_tensor(batch_size, seqlen_q, num_head, head_dim, dtype)
 
     fa2_fwd = FlashAttentionForwardAmpere(
         head_dim,
@@ -1241,78 +1227,63 @@ def run_flash_attention_fwd(
         num_threads,
         is_causal,
     )
-    # assume input is 16B align.
-    q_tensor = (
-        from_dlpack(q, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=3)
-        .mark_compact_shape_dynamic(
-            mode=3, stride_order=q.dim_order(), divisibility=(128 // dtype.width)
-        )
-    )
-    k_tensor = (
-        from_dlpack(k, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=3)
-        .mark_compact_shape_dynamic(
-            mode=3, stride_order=k.dim_order(), divisibility=(128 // dtype.width)
-        )
-    )
-    v_tensor = (
-        from_dlpack(v, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=3)
-        .mark_compact_shape_dynamic(
-            mode=3, stride_order=v.dim_order(), divisibility=(128 // dtype.width)
-        )
-    )
-    o_tensor = (
-        from_dlpack(o, assumed_align=16)
-        .mark_layout_dynamic(leading_dim=3)
-        .mark_compact_shape_dynamic(
-            mode=3, stride_order=o.dim_order(), divisibility=(128 // dtype.width)
-        )
-    )
+
     # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()
     # Get the raw stream pointer as a CUstream
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
     # compile the fa2 forward pass
-    compiled_fa2_fwd = cute.compile(
-        fa2_fwd, q_tensor, k_tensor, v_tensor, o_tensor, softmax_scale, current_stream
+    compiled_fa2_fwd = cute.compile(fa2_fwd, q, k, v, o, softmax_scale, current_stream)
+
+    if not skip_ref_check:
+        compiled_fa2_fwd(q, k, v, o, softmax_scale, current_stream)
+        torch.cuda.synchronize()
+        q_ref = q_torch.permute(0, 2, 1, 3)
+        k_ref = k_torch.permute(0, 2, 1, 3)
+        v_ref = v_torch.permute(0, 2, 1, 3)
+        torch.backends.cuda.enable_flash_sdp(enabled=True)
+        ref_o = torch.nn.functional.scaled_dot_product_attention(
+            q_ref, k_ref, v_ref, scale=softmax_scale, is_causal=is_causal
+        ).permute(0, 2, 1, 3)
+        torch.testing.assert_close(o_torch.cpu(), ref_o.cpu(), atol=1e-02, rtol=1e-04)
+        print("Results verified successfully!")
+
+    def generate_tensors():
+        q_workspace, _ = create_tensor(batch_size, seqlen_q, num_head, head_dim, dtype)
+        k_workspace, _ = create_tensor(batch_size, seqlen_k, num_head, head_dim, dtype)
+        v_workspace, _ = create_tensor(batch_size, seqlen_k, num_head, head_dim, dtype)
+        o_workspace, _ = create_tensor(batch_size, seqlen_q, num_head, head_dim, dtype)
+        return testing.JitArguments(
+            q_workspace,
+            k_workspace,
+            v_workspace,
+            o_workspace,
+            softmax_scale,
+            current_stream,
+        )
+
+    workspace_count = 1
+    if use_cold_l2:
+        one_workspace_bytes = (
+            q_torch.numel() * q_torch.element_size()
+            + k_torch.numel() * k_torch.element_size()
+            + v_torch.numel() * v_torch.element_size()
+            + o_torch.numel() * o_torch.element_size()
+        )
+        workspace_count = testing.get_workspace_count(
+            one_workspace_bytes, warmup_iterations, iterations
+        )
+
+    avg_time_us = testing.benchmark(
+        compiled_fa2_fwd,
+        workspace_generator=generate_tensors,
+        workspace_count=workspace_count,
+        stream=current_stream,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
     )
-    # warmup
-    for _ in range(warmup_iterations):
-        compiled_fa2_fwd(
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            softmax_scale,
-            current_stream,
-        )
-    # run the compiled fa2 forward pass
-    for _ in range(iterations):
-        compiled_fa2_fwd(
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            softmax_scale,
-            current_stream,
-        )
-    torch.cuda.synchronize()
 
-    if skip_ref_check:
-        return
-    # reference implementation
-    q_ref = q.permute(0, 2, 1, 3)
-    k_ref = k.permute(0, 2, 1, 3)
-    v_ref = v.permute(0, 2, 1, 3)
-    torch.backends.cuda.enable_flash_sdp(enabled=True)
-    ref_o = torch.nn.functional.scaled_dot_product_attention(
-        q_ref, k_ref, v_ref, scale=softmax_scale, is_causal=is_causal
-    ).permute(0, 2, 1, 3)
-
-    torch.testing.assert_close(o.cpu(), ref_o.cpu(), atol=1e-02, rtol=1e-04)
-
+    return avg_time_us  # Return execution time in microseconds
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -1334,9 +1305,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip_ref_check", action="store_true", help="Skip reference check"
     )
+    parser.add_argument(
+        "--use_cold_l2",
+        action="store_true",
+        default=False,
+        help="Use circular buffer tensor sets to ensure L2 cold cache",
+    )
 
     args = parser.parse_args()
-    run_flash_attention_fwd(
+    run(
         args.dtype,
         args.batch_size,
         args.seqlen_q,
@@ -1348,6 +1325,10 @@ if __name__ == "__main__":
         args.n_block_size,
         args.num_threads,
         args.is_causal,
+        args.warmup_iterations,
+        args.iterations,
+        args.skip_ref_check,
+        args.use_cold_l2,
     )
 
     print("PASS")

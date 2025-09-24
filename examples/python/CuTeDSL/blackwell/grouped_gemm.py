@@ -36,11 +36,11 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.testing as testing
 import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.torch as cutlass_torch
-from cutlass.cute.runtime import from_dlpack
 
 """
 A grouped GEMM example for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -89,7 +89,6 @@ there are also the following constrains:
 
 
 class GroupedGemmKernel:
-
     def __init__(
         self,
         acc_dtype: type[cutlass.Numeric],
@@ -159,7 +158,7 @@ class GroupedGemmKernel:
         self.tmem_ptr_sync_bar_id = 2
         # Barrier ID used by MMA/TMA warps to signal A/B tensormap initialization completion
         self.tensormap_ab_init_bar_id = 4
-        self.num_smem_capacity = sm100_utils.SMEM_CAPACITY["sm100"]
+        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         self.num_tma_load_bytes = 0
 
     def _setup_attributes(self):
@@ -217,18 +216,20 @@ class GroupedGemmKernel:
         )
 
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
-        self.num_acc_stage, self.num_ab_stage, self.num_epi_stage = (
-            self._compute_stages(
-                tiled_mma,
-                self.mma_tiler,
-                self.a_dtype,
-                self.b_dtype,
-                self.epi_tile,
-                self.c_dtype,
-                self.c_layout,
-                self.num_smem_capacity,
-                self.occupancy,
-            )
+        (
+            self.num_acc_stage,
+            self.num_ab_stage,
+            self.num_epi_stage,
+        ) = self._compute_stages(
+            tiled_mma,
+            self.mma_tiler,
+            self.a_dtype,
+            self.b_dtype,
+            self.epi_tile,
+            self.c_dtype,
+            self.c_layout,
+            self.smem_capacity,
+            self.occupancy,
         )
 
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -355,9 +356,11 @@ class GroupedGemmKernel:
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
         # Setup TMA load for A
-        a_op = self._get_tma_atom_kind(atom_thr_size, self.is_a_mcast)
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tma_tile_atom_A(
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
             a_op,
             initial_a,
             a_smem_layout,
@@ -367,9 +370,11 @@ class GroupedGemmKernel:
         )
 
         # Setup TMA load for B
-        b_op = self._get_tma_atom_kind(atom_thr_size, self.is_b_mcast)
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mn, tiled_mma.thr_id
+        )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tma_tile_atom_B(
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             b_op,
             initial_b,
             b_smem_layout,
@@ -389,7 +394,7 @@ class GroupedGemmKernel:
             cute.make_identity_layout(initial_c.shape), self.epi_tile
         )
         epi_smem_layout = cute.slice_(self.epi_smem_layout_staged, (None, None, 0))
-        tma_atom_c, tma_tensor_c = cpasync.make_tma_tile_atom(
+        tma_atom_c, tma_tensor_c = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
             initial_c,
             epi_smem_layout,
@@ -403,9 +408,7 @@ class GroupedGemmKernel:
         self.buffer_align_bytes = 1024
         self.size_tensormap_in_i64 = (
             0
-            if cutlass.const_expr(
-                self.tensormap_update_mode == utils.TensorMapUpdateMode.GMEM
-            )
+            if self.tensormap_update_mode == utils.TensorMapUpdateMode.GMEM
             else GroupedGemmKernel.num_tensormaps
             * GroupedGemmKernel.bytes_per_tensormap
             // 8
@@ -472,7 +475,6 @@ class GroupedGemmKernel:
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
             cluster=(*self.cluster_shape_mn, 1),
-            smem=self.shared_storage.size_in_bytes(),
             stream=stream,
         )
         return
@@ -564,16 +566,16 @@ class GroupedGemmKernel:
             for k_stage in range(self.num_ab_stage):
                 num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_init_arrive_cnt(ab_full_mbar_ptr + k_stage, 1)
-                    cute.arch.mbarrier_init_arrive_cnt(
+                    cute.arch.mbarrier_init(ab_full_mbar_ptr + k_stage, 1)
+                    cute.arch.mbarrier_init(
                         ab_empty_mbar_ptr + k_stage, num_tma_producer
                     )
         # Accumulator barrier init
         if warp_idx == self.mma_warp_id:
             for acc_stage in range(self.num_acc_stage):
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_init_arrive_cnt(acc_full_mbar_ptr + acc_stage, 1)
-                    cute.arch.mbarrier_init_arrive_cnt(
+                    cute.arch.mbarrier_init(acc_full_mbar_ptr + acc_stage, 1)
+                    cute.arch.mbarrier_init(
                         acc_empty_mbar_ptr + acc_stage, 8 if use_2cta_instrs else 4
                     )
         # Tensor memory dealloc barrier init
@@ -581,7 +583,7 @@ class GroupedGemmKernel:
             if warp_idx == self.tma_warp_id:
                 num_tmem_dealloc_threads = 32
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_init_arrive_cnt(
+                    cute.arch.mbarrier_init(
                         tmem_dealloc_mbar_ptr, num_tmem_dealloc_threads
                     )
         cute.arch.mbarrier_init_fence()
@@ -612,7 +614,7 @@ class GroupedGemmKernel:
         a_full_mcast_mask = None
         b_full_mcast_mask = None
         ab_empty_mcast_mask = None
-        if self.is_a_mcast or self.is_b_mcast or use_2cta_instrs:
+        if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
             a_full_mcast_mask = cpasync.create_tma_multicast_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
             )
@@ -621,7 +623,7 @@ class GroupedGemmKernel:
             )
             ab_empty_mcast_mask = a_full_mcast_mask | b_full_mcast_mask
         acc_full_mcast_mask = None
-        if use_2cta_instrs:
+        if cutlass.const_expr(use_2cta_instrs):
             acc_full_mcast_mask = cute.make_layout_image_mask(
                 cluster_layout_vmnk, block_in_cluster_coord_vmnk, mode=0
             )
@@ -646,15 +648,15 @@ class GroupedGemmKernel:
         #
         # Local_tile partition global tensors
         #
-        # (bM, bK, loopM, loopK, loopL)
+        # (bM, bK, RestM, RestK, RestL)
         gA_mkl = cute.local_tile(
             mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
-        # (bN, bK, loopN, loopK, loopL)
+        # (bN, bK, RestN, RestK, RestL)
         gB_nkl = cute.local_tile(
             mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
-        # (bM, bN, loopM, loopN, loopL)
+        # (bM, bN, RestM, RestN, RestL)
         gC_mnl = cute.local_tile(
             mC_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
         )
@@ -663,11 +665,11 @@ class GroupedGemmKernel:
         # Partition global tensor for TiledMMA_A/B/C
         #
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
-        # (MMA, MMA_M, MMA_K, loopM, loopK, loopL)
+        # (MMA, MMA_M, MMA_K, RestM, RestK, RestL)
         tCgA = thr_mma.partition_A(gA_mkl)
-        # (MMA, MMA_N, MMA_K, loopN, loopK, loopL)
+        # (MMA, MMA_N, MMA_K, RestN, RestK, RestL)
         tCgB = thr_mma.partition_B(gB_nkl)
-        # (MMA, MMA_M, MMA_N, loopM, loopN, loopL)
+        # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
 
         #
@@ -677,7 +679,7 @@ class GroupedGemmKernel:
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
         # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
+        # ((atom_v, rest_v), RestM, RestK, RestL)
         tAsA, tAgA = cpasync.tma_partition(
             tma_atom_a,
             block_in_cluster_coord_vmnk[2],
@@ -690,7 +692,7 @@ class GroupedGemmKernel:
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
         # ((atom_v, rest_v), STAGE)
-        # ((atom_v, rest_v), loopM, loopK, loopL)
+        # ((atom_v, rest_v), RestM, RestK, RestL)
         tBsB, tBgB = cpasync.tma_partition(
             tma_atom_b,
             block_in_cluster_coord_vmnk[1],
@@ -782,7 +784,7 @@ class GroupedGemmKernel:
             )
             tensormap_init_done = cutlass.Boolean(False)
             # tile count we have searched
-            total_k_block_cnt = cutlass.Int32(0)
+            total_k_tile_cnt = cutlass.Int32(0)
             # group index of last tile
             last_group_idx = cutlass.Int32(-1)
             work_tile = tile_sched.initial_work_tile_info()
@@ -792,7 +794,7 @@ class GroupedGemmKernel:
                     cur_tile_coord,
                     problem_sizes_mnkl,
                 )
-                cur_k_block_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
+                cur_k_tile_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
                 cur_group_idx = grouped_gemm_cta_tile_info.group_idx
                 is_group_changed = cur_group_idx != last_group_idx
                 # skip tensormap update if we're working on the same group
@@ -849,26 +851,26 @@ class GroupedGemmKernel:
                 #
                 # Slice to per mma tile index
                 #
-                # ((atom_v, rest_v), loopK)
+                # ((atom_v, rest_v), RestK)
                 tAgA_slice = tAgA[
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
                 ]
-                # ((atom_v, rest_v), loopK)
+                # ((atom_v, rest_v), RestK)
                 tBgB_slice = tBgB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
 
-                num_prev_k_blk = total_k_block_cnt
-                total_k_block_cnt += cur_k_block_cnt
+                num_prev_k_blk = total_k_tile_cnt
+                total_k_tile_cnt += cur_k_tile_cnt
 
-                # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
-                tma_wr_k_block = cutlass.Int32(0)
-                smem_wr_buffer = (num_prev_k_blk + tma_wr_k_block) % self.num_ab_stage
+                # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
+                tma_wr_k_tile = cutlass.Int32(0)
+                smem_wr_buffer = (num_prev_k_blk + tma_wr_k_tile) % self.num_ab_stage
                 tma_wr_ab_empty_phase = (
-                    num_prev_k_blk + tma_wr_k_block
+                    num_prev_k_blk + tma_wr_k_tile
                 ) // self.num_ab_stage % 2 ^ 1
-                peek_ab_empty_status = cute.arch.conditional_mbarrier_try_wait(
-                    tma_wr_k_block < cur_k_block_cnt,
+                peek_ab_empty_status = cute.arch.mbarrier_conditional_try_wait(
+                    tma_wr_k_tile < cur_k_tile_cnt,
                     ab_empty_mbar_ptr + smem_wr_buffer,
                     tma_wr_ab_empty_phase,
                 )
@@ -879,10 +881,10 @@ class GroupedGemmKernel:
                 #
                 # Tma load loop
                 #
-                for k_block in cutlass.range_dynamic(0, cur_k_block_cnt, 1, unroll=1):
-                    tma_wr_k_block_next = tma_wr_k_block + 1
+                for k_tile in cutlass.range(0, cur_k_tile_cnt, 1, unroll=1):
+                    tma_wr_k_tile_next = tma_wr_k_tile + 1
                     smem_wr_buffer_next = (
-                        num_prev_k_blk + tma_wr_k_block_next
+                        num_prev_k_blk + tma_wr_k_tile_next
                     ) % self.num_ab_stage
                     tma_wr_ab_empty_phase_next = (
                         tma_wr_ab_empty_phase ^ 1
@@ -898,17 +900,17 @@ class GroupedGemmKernel:
                             ab_empty_mbar_ptr + smem_wr_buffer, tma_wr_ab_empty_phase
                         )
 
-                    # Init AB buffer full transaction byte
+                    # Arrive AB buffer and expect full transaction bytes
                     if is_leader_cta:
                         with cute.arch.elect_one():
-                            cute.arch.mbarrier_init_tx_bytes(
+                            cute.arch.mbarrier_arrive_and_expect_tx(
                                 smem_full_mbar_ptr, self.num_tma_load_bytes
                             )
 
                     # Load A/B with TMA
                     cute.copy(
                         tma_atom_a,
-                        tAgA_slice[(None, tma_wr_k_block)],
+                        tAgA_slice[(None, tma_wr_k_tile)],
                         tAsA[(None, smem_wr_buffer)],
                         tma_bar_ptr=smem_full_mbar_ptr,
                         mcast_mask=a_full_mcast_mask,
@@ -919,7 +921,7 @@ class GroupedGemmKernel:
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, tma_wr_k_block)],
+                        tBgB_slice[(None, tma_wr_k_tile)],
                         tBsB[(None, smem_wr_buffer)],
                         tma_bar_ptr=smem_full_mbar_ptr,
                         mcast_mask=b_full_mcast_mask,
@@ -929,14 +931,14 @@ class GroupedGemmKernel:
                         ),
                     )
 
-                    # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
-                    peek_ab_empty_status = cute.arch.conditional_mbarrier_try_wait(
-                        tma_wr_k_block_next < cur_k_block_cnt,
+                    # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
+                    peek_ab_empty_status = cute.arch.mbarrier_conditional_try_wait(
+                        tma_wr_k_tile_next < cur_k_tile_cnt,
                         ab_empty_mbar_ptr + smem_wr_buffer_next,
                         tma_wr_ab_empty_phase_next,
                     )
 
-                    tma_wr_k_block = tma_wr_k_block_next
+                    tma_wr_k_tile = tma_wr_k_tile_next
                     smem_wr_buffer = smem_wr_buffer_next
                     tma_wr_ab_empty_phase = tma_wr_ab_empty_phase_next
 
@@ -949,7 +951,7 @@ class GroupedGemmKernel:
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
-            # initilize tensormap A, B for TMA warp
+            # initialize tensormap A, B for TMA warp
             if cutlass.const_expr(self.delegate_tensormap_ab_init):
                 tensormap_manager.init_tensormap_from_atom(
                     tma_atom_a, tensormap_a_init_ptr, self.mma_warp_id
@@ -995,34 +997,35 @@ class GroupedGemmKernel:
 
             work_tile = tile_sched.initial_work_tile_info()
             # tile count we have searched
-            total_k_block_cnt = cutlass.Int32(0)
+            total_k_tile_cnt = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 cur_tile_coord = work_tile.tile_idx
                 # MMA warp is only interested in number of tiles along K dimension
-                cur_k_block_cnt, cur_group_idx = (
-                    group_gemm_ts_helper.search_cluster_tile_count_k(
-                        cur_tile_coord,
-                        problem_sizes_mnkl,
-                    )
+                (
+                    cur_k_tile_cnt,
+                    cur_group_idx,
+                ) = group_gemm_ts_helper.search_cluster_tile_count_k(
+                    cur_tile_coord,
+                    problem_sizes_mnkl,
                 )
                 # Set tensor memory buffer for current tile
                 acc_buf_idx = tile_sched.num_tiles_executed % self.num_acc_stage
                 # (MMA, MMA_M, MMA_N)
                 tCtAcc = tCtAcc_base[(None, None, None, acc_buf_idx)]
 
-                num_prev_k_blk = total_k_block_cnt
-                total_k_block_cnt += cur_k_block_cnt
+                num_prev_k_blk = total_k_tile_cnt
+                total_k_tile_cnt += cur_k_tile_cnt
 
-                # Peek (try_wait) AB buffer full for k_block = 0
-                mma_rd_k_block = cutlass.Int32(0)
-                smem_rd_buffer = (num_prev_k_blk + mma_rd_k_block) % self.num_ab_stage
+                # Peek (try_wait) AB buffer full for k_tile = 0
+                mma_rd_k_tile = cutlass.Int32(0)
+                smem_rd_buffer = (num_prev_k_blk + mma_rd_k_tile) % self.num_ab_stage
                 need_check_rd_buffer_full = (
-                    mma_rd_k_block < cur_k_block_cnt and is_leader_cta
+                    mma_rd_k_tile < cur_k_tile_cnt and is_leader_cta
                 )
                 mma_rd_ab_full_phase = (
-                    (num_prev_k_blk + mma_rd_k_block) // self.num_ab_stage % 2
+                    (num_prev_k_blk + mma_rd_k_tile) // self.num_ab_stage % 2
                 )
-                peek_ab_full_status = cute.arch.conditional_mbarrier_try_wait(
+                peek_ab_full_status = cute.arch.mbarrier_conditional_try_wait(
                     need_check_rd_buffer_full,
                     ab_full_mbar_ptr + smem_rd_buffer,
                     mma_rd_ab_full_phase,
@@ -1047,10 +1050,10 @@ class GroupedGemmKernel:
                 #
                 # Mma mainloop
                 #
-                for k_block in cutlass.range_dynamic(0, cur_k_block_cnt, 1, unroll=1):
-                    mma_rd_k_block_next = cutlass.Int32(k_block + 1)
+                for k_tile in range(cur_k_tile_cnt):
+                    mma_rd_k_tile_next = cutlass.Int32(k_tile + 1)
                     smem_rd_buffer_next = (
-                        num_prev_k_blk + mma_rd_k_block_next
+                        num_prev_k_blk + mma_rd_k_tile_next
                     ) % self.num_ab_stage
                     mma_rd_ab_full_phase_next = (
                         mma_rd_ab_full_phase ^ 1
@@ -1065,18 +1068,18 @@ class GroupedGemmKernel:
                             )
 
                         # tCtAcc += tCrA * tCrB
-                        num_kphases = cute.size(tCrA, mode=[2])
-                        for kphase_idx in range(num_kphases):
-                            kphase_coord = (None, None, kphase_idx, smem_rd_buffer)
+                        num_kblocks = cute.size(tCrA, mode=[2])
+                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                            kblock_coord = (None, None, kblock_idx, smem_rd_buffer)
 
                             cute.gemm(
                                 tiled_mma,
                                 tCtAcc,
-                                tCrA[kphase_coord],
-                                tCrB[kphase_coord],
+                                tCrA[kblock_coord],
+                                tCrB[kblock_coord],
                                 tCtAcc,
                             )
-                            # Enable accumulate on tCtAcc after first kphase
+                            # Enable accumulate on tCtAcc after first kblock
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                         # Async arrive AB buffer empty
@@ -1087,18 +1090,18 @@ class GroupedGemmKernel:
                                 self.cta_group,
                             )
 
-                    # Peek (try_wait) AB buffer full for k_block = k_block + 1
+                    # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
                     need_check_rd_buffer_full = (
-                        mma_rd_k_block_next < cur_k_block_cnt and is_leader_cta
+                        mma_rd_k_tile_next < cur_k_tile_cnt and is_leader_cta
                     )
 
-                    peek_ab_full_status = cute.arch.conditional_mbarrier_try_wait(
+                    peek_ab_full_status = cute.arch.mbarrier_conditional_try_wait(
                         need_check_rd_buffer_full,
                         ab_full_mbar_ptr + smem_rd_buffer_next,
                         mma_rd_ab_full_phase_next,
                     )
 
-                    mma_rd_k_block = mma_rd_k_block_next
+                    mma_rd_k_tile = mma_rd_k_tile_next
                     smem_rd_buffer = smem_rd_buffer_next
                     mma_rd_ab_full_phase = mma_rd_ab_full_phase_next
 
@@ -1161,19 +1164,23 @@ class GroupedGemmKernel:
             #
             # Partition for epilogue
             #
-            tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = (
-                self.epilog_tmem_copy_and_partition(
-                    epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
-                )
+            (
+                tiled_copy_t2r,
+                tTR_tAcc_base,
+                tTR_rAcc,
+            ) = self.epilog_tmem_copy_and_partition(
+                epi_tidx, tCtAcc_base, tCgC, epi_tile, use_2cta_instrs
             )
 
             tTR_rC = cute.make_fragment(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
             )
-            tma_atom_c, bSG_sC, bSG_gC_partitioned = (
-                self.epilog_gmem_copy_and_partition(tma_atom_c, tCgC, epi_tile, sC)
-            )
+            (
+                tma_atom_c,
+                bSG_sC,
+                bSG_gC_partitioned,
+            ) = self.epilog_gmem_copy_and_partition(tma_atom_c, tCgC, epi_tile, sC)
 
             #
             # Persistent tile scheduling loop
@@ -1193,7 +1200,7 @@ class GroupedGemmKernel:
             # wait tensormap initialization complete before update
             tensormap_manager.fence_tensormap_initialization()
             # tile count we have searched
-            total_k_block_cnt = cutlass.Int32(0)
+            total_k_tile_cnt = cutlass.Int32(0)
             # group index of last tile
             last_group_idx = cutlass.Int32(-1)
             while work_tile.is_valid_tile:
@@ -1232,8 +1239,8 @@ class GroupedGemmKernel:
                     grouped_gemm_cta_tile_info.cta_tile_idx_n,
                     0,
                 )
-                cur_k_block_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
-                total_k_block_cnt += cur_k_block_cnt
+                cur_k_tile_cnt = grouped_gemm_cta_tile_info.cta_tile_count_k
+                total_k_tile_cnt += cur_k_tile_cnt
 
                 #
                 # Slice to per mma tile index
@@ -1270,7 +1277,7 @@ class GroupedGemmKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
-                for subtile_idx in cutlass.range_dynamic(subtile_cnt):
+                for subtile_idx in range(subtile_cnt):
                     #
                     # Load accumulator from tensor memory buffer to register
                     #
@@ -1362,8 +1369,8 @@ class GroupedGemmKernel:
             #
             if warp_idx == self.epilog_warp_id[0]:
                 cute.arch.mbarrier_wait(
-                    (ab_empty_mbar_ptr + ((total_k_block_cnt - 1) % self.num_ab_stage)),
-                    (((total_k_block_cnt - 1) // self.num_ab_stage) % 2),
+                    (ab_empty_mbar_ptr + ((total_k_tile_cnt - 1) % self.num_ab_stage)),
+                    (((total_k_tile_cnt - 1) // self.num_ab_stage) % 2),
                 )
 
     @cute.jit
@@ -1493,11 +1500,11 @@ class GroupedGemmKernel:
         # (T2R, T2R_M, T2R_N, EPI_M, EPI_M, STAGE)
         tTR_tAcc = thr_copy_t2r.partition_S(tAcc_epi)
 
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, loopM, loopN, loopL)
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
         gC_mnl_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
-        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, loopM, loopN, loopL)
+        # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
         tTR_gC = thr_copy_t2r.partition_D(gC_mnl_epi)
         # (T2R, T2R_M, T2R_N)
         tTR_rAcc = cute.make_fragment(
@@ -1533,11 +1540,7 @@ class GroupedGemmKernel:
         copy_atom_r2s = sm100_utils.get_smem_store_op(
             self.c_layout, self.c_dtype, self.acc_dtype, tiled_copy_t2r
         )
-        tiled_copy_r2s = cute.make_tiled_copy(
-            copy_atom_r2s,
-            layout_tv=tiled_copy_t2r.layout_dst_tv_tiled,
-            tiler_mn=tiled_copy_t2r.tiler_mn,
-        )
+        tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         # (R2S, R2S_M, R2S_N, PIPE_D)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
         tRS_sC = thr_copy_r2s.partition_D(sC)
@@ -1569,14 +1572,14 @@ class GroupedGemmKernel:
                  - tCgC: The destination global memory tensor partitioned for the TMA operation.
         :rtype: tuple[cute.CopyAtom, cute.Tensor, cute.Tensor]
         """
-        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, loopM, loopN, loopL)
+        # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, RestM, RestN, RestL)
         gC_epi = cute.flat_divide(
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
         sC_for_tma_partition = cute.group_modes(sC, 0, 2)
         gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
         # ((ATOM_V, REST_V), EPI_M, EPI_N)
-        # ((ATOM_V, REST_V), EPI_M, EPI_N, loopM, loopN, loopL)
+        # ((ATOM_V, REST_V), EPI_M, EPI_N, RestM, RestN, RestL)
         bSG_sC, bSG_gC = cpasync.tma_partition(
             tma_atom_c,
             0,
@@ -1595,7 +1598,7 @@ class GroupedGemmKernel:
         epi_tile: cute.Tile,
         c_dtype: type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
-        num_smem_capacity: int,
+        smem_capacity: int,
         occupancy: int,
     ) -> tuple[int, int, int]:
         """Computes the number of stages for accumulator, A/B operands, and epilogue based on heuristics.
@@ -1614,8 +1617,8 @@ class GroupedGemmKernel:
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C in global memory.
         :type c_layout: utils.LayoutEnum
-        :param num_smem_capacity: Total available shared memory capacity in bytes.
-        :type num_smem_capacity: int
+        :param smem_capacity: Total available shared memory capacity in bytes.
+        :type smem_capacity: int
         :param occupancy: Target number of CTAs per SM (occupancy).
         :type occupancy: int
 
@@ -1658,7 +1661,7 @@ class GroupedGemmKernel:
         # Subtract reserved bytes and initial epilogue bytes
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (
-            num_smem_capacity // occupancy
+            smem_capacity // occupancy
             - GroupedGemmKernel.reserved_smem_bytes
             - epi_bytes
         ) // ab_bytes_per_stage
@@ -1667,7 +1670,7 @@ class GroupedGemmKernel:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
         remaining_smem = (
-            num_smem_capacity
+            smem_capacity
             - occupancy * ab_bytes_per_stage * num_ab_stage
             - occupancy * (GroupedGemmKernel.reserved_smem_bytes + epi_bytes)
         )
@@ -1776,20 +1779,6 @@ class GroupedGemmKernel:
         return ab_bytes + epi_bytes
 
     @staticmethod
-    def _get_tma_atom_kind(atom_sm_cnt: int, mcast: bool):
-        """Select the appropriate TMA copy atom based on the number of SMs and the multicast flag."""
-        if atom_sm_cnt == 2 and mcast:
-            return cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.TWO)
-        elif atom_sm_cnt == 2 and not mcast:
-            return cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
-        elif atom_sm_cnt == 1 and mcast:
-            return cpasync.CopyBulkTensorTileG2SMulticastOp(tcgen05.CtaGroup.ONE)
-        elif atom_sm_cnt == 1 and not mcast:
-            return cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
-
-        raise ValueError(f"Invalid atom_sm_cnt: {atom_sm_cnt} and {mcast}")
-
-    @staticmethod
     def _compute_num_tmem_alloc_cols(
         tiled_mma: cute.TiledMma,
         mma_tiler: tuple[int, int, int],
@@ -1822,7 +1811,136 @@ class GroupedGemmKernel:
     tensor_memory_management_bytes = 12
 
 
-def run_grouped_gemm(
+# Create tensor and return the pointer, tensor, and stride
+def create_tensor_and_stride(
+    l: int,
+    mode0: int,
+    mode1: int,
+    is_mode0_major: bool,
+    dtype: type[cutlass.Numeric],
+    is_dynamic_layout: bool = True,
+    torch_tensor_cpu: torch.Tensor = None,
+) -> tuple[int, torch.Tensor, cute.Tensor, torch.Tensor, tuple[int, int]]:
+    """Create a GPU tensor from scratch or based on an existing CPU tensor.
+
+    :param torch_tensor_cpu: Optional existing CPU tensor to reuse. If None, creates a new one.
+    :type torch_tensor_cpu: torch.Tensor, optional
+    """
+    if torch_tensor_cpu is None:
+        # Create new CPU tensor
+        torch_tensor_cpu = cutlass_torch.matrix(l, mode0, mode1, is_mode0_major, dtype)
+
+    # Create GPU tensor from CPU tensor (new or existing)
+    cute_tensor, torch_tensor = cutlass_torch.cute_tensor_like(
+        torch_tensor_cpu, dtype, is_dynamic_layout, assumed_align=16
+    )
+    return (
+        torch_tensor.data_ptr(),
+        torch_tensor,
+        cute_tensor,
+        torch_tensor_cpu,
+        torch_tensor.stride()[:-1],
+    )
+
+
+def create_tensors_for_all_groups(
+    problem_sizes_mnkl: List[tuple[int, int, int, int]],
+    ab_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    a_major: str,
+    b_major: str,
+    c_major: str,
+    torch_fp32_tensors_abc: List[List[torch.Tensor]] = None,
+) -> tuple[
+    List[List[int]],
+    List[List[torch.Tensor]],
+    List[tuple],
+    List[List[tuple]],
+    List[List[torch.Tensor]],
+]:
+    if torch_fp32_tensors_abc is not None and len(torch_fp32_tensors_abc) != len(
+        problem_sizes_mnkl
+    ):
+        raise ValueError("torch_fp32_tensors_abc must have one entry per group")
+
+    # Initialize lists to store tensors for all groups
+    new_torch_fp32_tensors_abc = (
+        [] if torch_fp32_tensors_abc is None else torch_fp32_tensors_abc
+    )
+    torch_tensors_abc = []
+    cute_tensors_abc = []
+    strides_abc = []
+    ptrs_abc = []
+
+    # Iterate through all groups and create tensors for each group
+    for group_idx, (m, n, k, l) in enumerate(problem_sizes_mnkl):
+        # Get existing CPU tensors if available, otherwise None
+        existing_cpu_a = (
+            torch_fp32_tensors_abc[group_idx][0] if torch_fp32_tensors_abc else None
+        )
+        existing_cpu_b = (
+            torch_fp32_tensors_abc[group_idx][1] if torch_fp32_tensors_abc else None
+        )
+        existing_cpu_c = (
+            torch_fp32_tensors_abc[group_idx][2] if torch_fp32_tensors_abc else None
+        )
+
+        # Create tensors (reusing CPU tensors if provided)
+        (
+            ptr_a,
+            torch_tensor_a,
+            cute_tensor_a,
+            tensor_fp32_a,
+            stride_mk_a,
+        ) = create_tensor_and_stride(
+            l, m, k, a_major == "m", ab_dtype, torch_tensor_cpu=existing_cpu_a
+        )
+        (
+            ptr_b,
+            torch_tensor_b,
+            cute_tensor_b,
+            tensor_fp32_b,
+            stride_nk_b,
+        ) = create_tensor_and_stride(
+            l, n, k, b_major == "n", ab_dtype, torch_tensor_cpu=existing_cpu_b
+        )
+        (
+            ptr_c,
+            torch_tensor_c,
+            cute_tensor_c,
+            tensor_fp32_c,
+            stride_mn_c,
+        ) = create_tensor_and_stride(
+            l, m, n, c_major == "m", c_dtype, torch_tensor_cpu=existing_cpu_c
+        )
+
+        # Only append to new_torch_fp32_tensors_abc if we created new CPU tensors
+        if torch_fp32_tensors_abc is None:
+            new_torch_fp32_tensors_abc.append(
+                [tensor_fp32_a, tensor_fp32_b, tensor_fp32_c]
+            )
+
+        ptrs_abc.append([ptr_a, ptr_b, ptr_c])
+        torch_tensors_abc.append([torch_tensor_a, torch_tensor_b, torch_tensor_c])
+        strides_abc.append([stride_mk_a, stride_nk_b, stride_mn_c])
+        cute_tensors_abc.append(
+            (
+                cute_tensor_a,
+                cute_tensor_b,
+                cute_tensor_c,
+            )
+        )
+
+    return (
+        ptrs_abc,
+        torch_tensors_abc,
+        cute_tensors_abc,
+        strides_abc,
+        new_torch_fp32_tensors_abc,
+    )
+
+
+def run(
     num_groups: int,
     problem_sizes_mnkl: tuple[int, int, int, int],
     ab_dtype: Type[cutlass.Numeric],
@@ -1839,8 +1957,16 @@ def run_grouped_gemm(
     warmup_iterations: int,
     iterations: int,
     skip_ref_check: bool,
+    use_cold_l2: bool = False,
+    **kwargs,
 ):
-    """Run grouped GEMM example with specified configurations."""
+    """Run grouped GEMM example with specified configurations.
+
+    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
+    :type use_cold_l2: bool, optional
+    :return: Execution time of the GEMM kernel in microseconds
+    :rtype: float
+    """
     print(f"Running Blackwell Grouped GEMM test with:")
     print(f"{num_groups} groups")
     for i, (m, n, k, l) in enumerate(problem_sizes_mnkl):
@@ -1854,6 +1980,7 @@ def run_grouped_gemm(
     print(f"Warmup iterations: {warmup_iterations}")
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
+    print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
 
     # Skip unsupported types
     if ab_dtype not in {
@@ -1909,81 +2036,22 @@ def run_grouped_gemm(
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
-    torch.manual_seed(2025)
+    # Create tensors for all groups using the new function
+    (
+        ptrs_abc,
+        torch_tensors_abc,
+        cute_tensors_abc,
+        strides_abc,
+        torch_fp32_tensors_abc,
+    ) = create_tensors_for_all_groups(
+        problem_sizes_mnkl,
+        ab_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        c_major,
+    )
 
-    # Create tensor and return the pointer, tensor, and stride
-    def create_tensor_and_stride(
-        l: int,
-        mode0: int,
-        mode1: int,
-        is_mode0_major: bool,
-        dtype: type[cutlass.Numeric],
-        is_dynamic_layout: bool = True,
-    ) -> tuple[int, torch.Tensor, cute.Tensor, torch.Tensor, tuple[int, int]]:
-        # is_mode0_major: (l, mode1, mode0) -> (mode0, mode1, l)
-        # else: (l, mode0, mode1) -> (mode0, mode1, l)
-        shape = (l, mode1, mode0) if is_mode0_major else (l, mode0, mode1)
-        permute_order = (2, 1, 0) if is_mode0_major else (1, 2, 0)
-        # omit stride for L mode as it is always 1 for grouped GEMM
-        strides = (1, mode0) if is_mode0_major else (mode1, 1)
-        assert dtype in {cutlass.Float16, cutlass.BFloat16, cutlass.Float32}
-        is_unsigned = False
-
-        torch_dtype = cutlass_torch.dtype(dtype)
-        torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-            shape,
-            torch_dtype,
-            permute_order=permute_order,
-            init_type=cutlass_torch.TensorInitType.RANDOM,
-            init_config=cutlass_torch.RandomInitConfig(
-                min_val=0 if is_unsigned else -2, max_val=4 if is_unsigned else 2
-            ),
-        )
-        torch_tensor = torch_tensor_cpu.cuda()
-        f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
-
-        cute_tensor = from_dlpack(torch_tensor, assumed_align=16)
-        if is_dynamic_layout:
-            cute_tensor = cute_tensor.mark_layout_dynamic(
-                leading_dim=(0 if is_mode0_major else 1)
-            )
-        cute_tensor = cutlass_torch.convert_cute_tensor(
-            f32_torch_tensor,
-            cute_tensor,
-            dtype,
-            is_dynamic_layout=is_dynamic_layout,
-        )
-        # Get pointer of the tensor
-        ptr = torch_tensor.data_ptr()
-        return ptr, torch_tensor, cute_tensor, f32_torch_tensor, strides
-
-    # iterate all groups and create tensors for each group
-    torch_fp32_tensors_abc = []
-    torch_tensors_abc = []
-    cute_tensors_abc = []
-    strides_abc = []
-    ptrs_abc = []
-    for _, (m, n, k, l) in enumerate(problem_sizes_mnkl):
-        ptr_a, torch_tensor_a, cute_tensor_a, tensor_fp32_a, stride_mk_a = (
-            create_tensor_and_stride(l, m, k, a_major == "m", ab_dtype)
-        )
-        ptr_b, torch_tensor_b, cute_tensor_b, tensor_fp32_b, stride_nk_b = (
-            create_tensor_and_stride(l, n, k, b_major == "n", ab_dtype)
-        )
-        ptr_c, torch_tensor_c, cute_tensor_c, tensor_fp32_c, stride_mn_c = (
-            create_tensor_and_stride(l, m, n, c_major == "m", c_dtype)
-        )
-        ptrs_abc.append([ptr_a, ptr_b, ptr_c])
-        torch_tensors_abc.append([torch_tensor_a, torch_tensor_b, torch_tensor_c])
-        torch_fp32_tensors_abc.append([tensor_fp32_a, tensor_fp32_b, tensor_fp32_c])
-        strides_abc.append([stride_mk_a, stride_nk_b, stride_mn_c])
-        cute_tensors_abc.append(
-            (
-                cute_tensor_a,
-                cute_tensor_b,
-                cute_tensor_c,
-            )
-        )
     # Choose A, B, C with the smallest size to create initial tensormaps
     key_size_a = lambda item: item[1][0] * item[1][2]
     key_size_b = lambda item: item[1][1] * item[1][2]
@@ -2005,19 +2073,16 @@ def run_grouped_gemm(
     )
     # Prepare tensormap buffer for each SM
     num_tensormap_buffers = sm_count
-    tensormap_pytorch_tensor = (
-        torch.empty(
-            (
-                num_tensormap_buffers,
-                GroupedGemmKernel.num_tensormaps,
-                GroupedGemmKernel.bytes_per_tensormap // 8,
-            ),
-            dtype=torch.int64,
-        )
-        .fill_(0)
-        .cuda()
+    tensormap_shape = (
+        num_tensormap_buffers,
+        GroupedGemmKernel.num_tensormaps,
+        GroupedGemmKernel.bytes_per_tensormap // 8,
     )
-    tensormap_cute_tensor = from_dlpack(tensormap_pytorch_tensor, assumed_align=16)
+    tensor_of_tensormap, tensor_of_tensormap_torch = cutlass_torch.cute_tensor_like(
+        torch.empty(tensormap_shape, dtype=torch.int64),
+        cutlass.Int64,
+        is_dynamic_layout=False,
+    )
 
     grouped_gemm = GroupedGemmKernel(
         acc_dtype,
@@ -2027,23 +2092,30 @@ def run_grouped_gemm(
         tensormap_update_mode,
     )
 
-    # Convert integer list to torch tensor and cute tensor
-    def convert_list_to_tensor(l, dtype) -> tuple[torch.Tensor, cute.Tensor]:
-        torch_tensor = torch.tensor(l, dtype=dtype).cuda()
-        cute_tensor = from_dlpack(torch_tensor, assumed_align=16)
-        return torch_tensor, cute_tensor
-
     # layout (num_groups, 4):(4, 1)
-    problem_sizes_mnkl_torch_tensor, problem_sizes_mnkl_cute_tensor = (
-        convert_list_to_tensor(problem_sizes_mnkl, torch.int32)
+    (
+        tensor_of_dim_size_mnkl,
+        tensor_of_dim_size_mnkl_torch,
+    ) = cutlass_torch.cute_tensor_like(
+        torch.tensor(problem_sizes_mnkl, dtype=torch.int32),
+        cutlass.Int32,
+        is_dynamic_layout=False,
+        assumed_align=16,
     )
     # layout (num_groups, 3, 2):(6, 2, 1)
-    strides_abc_torch_tensor, strides_abc_cute_tensor = convert_list_to_tensor(
-        strides_abc, torch.int32
+    tensor_of_strides_abc, tensor_of_strides_abc_torch = cutlass_torch.cute_tensor_like(
+        torch.tensor(strides_abc, dtype=torch.int32),
+        cutlass.Int32,
+        is_dynamic_layout=False,
+        assumed_align=16,
     )
+
     # layout (num_groups,3):(3, 1)
-    ptrs_abc_torch_tensor, ptrs_abc_cute_tensor = convert_list_to_tensor(
-        ptrs_abc, torch.int64
+    tensor_of_ptrs_abc, tensor_of_ptrs_abc_torch = cutlass_torch.cute_tensor_like(
+        torch.tensor(ptrs_abc, dtype=torch.int64),
+        cutlass.Int64,
+        is_dynamic_layout=False,
+        assumed_align=16,
     )
 
     # Compute total number of cluster tiles we need to compute for given grouped GEMM problem
@@ -2077,10 +2149,9 @@ def run_grouped_gemm(
         problem_sizes_mnkl, cluster_tile_shape_mn
     )
 
-    # Get current CUDA stream from PyTorch
-    torch_stream = torch.cuda.current_stream()
-    # Get the raw stream pointer as a CUstream
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
+    # Initialize Stream
+    current_stream = cutlass_torch.default_stream()
+
     # Compile grouped GEMM kernel
     compiled_grouped_gemm = cute.compile(
         grouped_gemm,
@@ -2088,59 +2159,137 @@ def run_grouped_gemm(
         initial_cute_tensors_abc[1],
         initial_cute_tensors_abc[2],
         num_groups,
-        problem_sizes_mnkl_cute_tensor,
-        strides_abc_cute_tensor,
-        ptrs_abc_cute_tensor,
+        tensor_of_dim_size_mnkl,
+        tensor_of_strides_abc,
+        tensor_of_ptrs_abc,
         total_num_clusters,
-        tensormap_cute_tensor,
+        tensor_of_tensormap,
         max_active_clusters,
         current_stream,
     )
 
-    # Launch GPU kernel
-    # Warm up
-    for _ in range(warmup_iterations):
+    if not skip_ref_check:
         compiled_grouped_gemm(
             initial_cute_tensors_abc[0],
             initial_cute_tensors_abc[1],
             initial_cute_tensors_abc[2],
-            problem_sizes_mnkl_cute_tensor,
-            strides_abc_cute_tensor,
-            ptrs_abc_cute_tensor,
-            tensormap_cute_tensor,
-            current_stream,
-        )
-    # Execution
-    for i in range(iterations):
-        compiled_grouped_gemm(
-            initial_cute_tensors_abc[0],
-            initial_cute_tensors_abc[1],
-            initial_cute_tensors_abc[2],
-            problem_sizes_mnkl_cute_tensor,
-            strides_abc_cute_tensor,
-            ptrs_abc_cute_tensor,
-            tensormap_cute_tensor,
+            tensor_of_dim_size_mnkl,
+            tensor_of_strides_abc,
+            tensor_of_ptrs_abc,
+            tensor_of_tensormap,
             current_stream,
         )
 
-    # Compute reference result
-    if not skip_ref_check:
-        refs = []
-        for a, b, _ in torch_fp32_tensors_abc:
-            ref = (torch.einsum("mkl,nkl->mnl", a, b)).cpu()
-            refs.append(ref)
-        for i, ((_, _, c), ref) in enumerate(zip(torch_tensors_abc, refs)):
+        # Compute reference result
+        for i, (a, b, c) in enumerate(torch_tensors_abc):
+            ref = torch.einsum(
+                "mkl,nkl->mnl",
+                a.cpu().to(dtype=torch.float32),
+                b.cpu().to(dtype=torch.float32),
+            )
             print(f"checking group {i}")
-            if c_dtype == cutlass.Float32:
-                ref_c = ref
-            else:
-                ref_c = ref.to(cutlass_torch.dtype(c_dtype))
             torch.testing.assert_close(
                 c.cpu(),
-                ref_c,
+                ref.to(cutlass_torch.dtype(c_dtype)),
                 atol=tolerance,
                 rtol=1e-05,
             )
+
+    def generate_tensors():
+        # Reuse existing CPU tensors and create new GPU tensors from them
+        (
+            ptrs_abc_workspace,
+            torch_tensors_abc_workspace,
+            cute_tensors_abc_workspace,
+            strides_abc_workspace,
+            _,
+        ) = create_tensors_for_all_groups(
+            problem_sizes_mnkl,
+            ab_dtype,
+            c_dtype,
+            a_major,
+            b_major,
+            c_major,
+            torch_fp32_tensors_abc,
+        )
+
+        initial_cute_tensors_abc_workspace = [
+            cute_tensors_abc_workspace[min_a_idx][0],  # A with smallest (m, k)
+            cute_tensors_abc_workspace[min_b_idx][1],  # B with smallest (n, k)
+            cute_tensors_abc_workspace[min_c_idx][2],  # C with smallest (m, n)
+        ]
+
+        # Create new tensors for this workspace
+        tensor_of_strides_abc_workspace, _ = cutlass_torch.cute_tensor_like(
+            torch.tensor(strides_abc_workspace, dtype=torch.int32),
+            cutlass.Int32,
+            is_dynamic_layout=False,
+            assumed_align=16,
+        )
+
+        tensor_of_ptrs_abc_workspace, _ = cutlass_torch.cute_tensor_like(
+            torch.tensor(ptrs_abc_workspace, dtype=torch.int64),
+            cutlass.Int64,
+            is_dynamic_layout=False,
+            assumed_align=16,
+        )
+
+        tensormap_workspace, _ = cutlass_torch.cute_tensor_like(
+            torch.empty(tensormap_shape, dtype=torch.int64),
+            cutlass.Int64,
+            is_dynamic_layout=False,
+        )
+
+        return testing.JitArguments(
+            initial_cute_tensors_abc_workspace[0],
+            initial_cute_tensors_abc_workspace[1],
+            initial_cute_tensors_abc_workspace[2],
+            tensor_of_dim_size_mnkl,
+            tensor_of_strides_abc_workspace,
+            tensor_of_ptrs_abc_workspace,
+            tensormap_workspace,
+            current_stream,
+        )
+
+    workspace_count = 1
+    if use_cold_l2:
+        one_workspace_bytes = (
+            sum(
+                [
+                    sum(
+                        [
+                            torch_tensor.numel() * torch_tensor.element_size()
+                            for torch_tensor in group_tensors
+                        ]
+                    )
+                    for group_tensors in torch_tensors_abc
+                ]
+            )
+            +
+            # Add size of strides tensor
+            tensor_of_strides_abc_torch.numel()
+            * tensor_of_strides_abc_torch.element_size()
+            +
+            # Add size of ptrs tensor
+            tensor_of_ptrs_abc_torch.numel() * tensor_of_ptrs_abc_torch.element_size()
+            +
+            # Add size of tensormap tensor
+            tensor_of_tensormap_torch.numel() * tensor_of_tensormap_torch.element_size()
+        )
+        workspace_count = testing.get_workspace_count(
+            one_workspace_bytes, warmup_iterations, iterations
+        )
+
+    exec_time = testing.benchmark(
+        compiled_grouped_gemm,
+        workspace_generator=generate_tensors,
+        workspace_count=workspace_count,
+        stream=current_stream,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+    )
+
+    return exec_time  # Return execution time in microseconds
 
 
 if __name__ == "__main__":
@@ -2238,6 +2387,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--skip_ref_check", action="store_true", help="Skip reference checking"
     )
+    parser.add_argument(
+        "--use_cold_l2",
+        action="store_true",
+        default=False,
+        help="Use circular buffer tensor sets to ensure L2 cold cache",
+    )
 
     args = parser.parse_args()
 
@@ -2266,7 +2421,9 @@ if __name__ == "__main__":
     else:
         tensormap_update_mode = utils.TensorMapUpdateMode.SMEM
 
-    run_grouped_gemm(
+    torch.manual_seed(2025)
+
+    run(
         args.num_groups,
         args.problem_sizes_mnkl,
         args.ab_dtype,
@@ -2283,5 +2440,6 @@ if __name__ == "__main__":
         args.warmup_iterations,
         args.iterations,
         args.skip_ref_check,
+        args.use_cold_l2,
     )
     print("PASS")

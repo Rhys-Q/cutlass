@@ -11,6 +11,7 @@
 
 from functools import partial
 from typing import Optional, Tuple, Union, Callable
+from typing_extensions import deprecated
 
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -26,7 +27,19 @@ from cutlass._mlir.dialects.nvvm import (
     RoundingModeKind,
 )
 
-from ..typing import Int, Boolean, Int32, Float32, Numeric, as_numeric
+from ..typing import (
+    Int,
+    Boolean,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Int64,
+    Float32,
+    BFloat16,
+    Numeric,
+    as_numeric,
+)
 
 WARP_SIZE = 32
 FULL_MASK = 0xFFFFFFFF
@@ -190,19 +203,97 @@ def shuffle_sync_op(
     """
     if not isinstance(value, Numeric):
         value = as_numeric(value)
-    return type(value)(
-        nvvm.shfl_sync(
-            type(value).mlir_type,
+    if value.width > 64:
+        raise ValueError("shuffle_sync only supports values up to 64 bits")
+
+    orig_type = type(value)
+    if value.width < 32:
+        if value.dtype.is_float:
+            value = value.to(Float32)
+        else:
+            if value.signed:
+                value = value.to(Int32)
+            else:
+                value = value.to(Uint32)
+        return orig_type(
+            nvvm.shfl_sync(
+                type(value).mlir_type,
+                Int32(mask).ir_value(loc=loc, ip=ip),
+                value.ir_value(loc=loc, ip=ip),
+                Int32(offset).ir_value(loc=loc, ip=ip),
+                Int32(mask_and_clamp).ir_value(loc=loc, ip=ip),
+                kind,
+                loc=loc,
+                ip=ip,
+            )
+        )
+    elif value.width == 32:
+        return orig_type(
+            nvvm.shfl_sync(
+                type(value).mlir_type,
+                Int32(mask).ir_value(loc=loc, ip=ip),
+                value.ir_value(loc=loc, ip=ip),
+                Int32(offset).ir_value(loc=loc, ip=ip),
+                Int32(mask_and_clamp).ir_value(loc=loc, ip=ip),
+                kind,
+                loc=loc,
+                ip=ip,
+            )
+        )
+    else:
+        if value.width != 64:
+            raise ValueError(
+                "shuffle_sync only supports 64 bits values when the bit width is larger than 32"
+            )
+        value = llvm.bitcast(
+            T.i64(), value.to(ir.Value, loc=loc, ip=ip), loc=loc, ip=ip
+        )
+        # extract low 32 bits
+        low_32_bits = llvm.trunc(
+            T.i32(), value, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip
+        )
+        # extract high 32 bits
+        high_32_bits = llvm.lshr(
+            value, Int64(32).ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+        )
+        high_32_bits = llvm.trunc(
+            T.i32(), high_32_bits, llvm.IntegerOverflowFlags.none, loc=loc, ip=ip
+        )
+
+        low_32_bits_shfl = nvvm.shfl_sync(
+            T.i32(),
             Int32(mask).ir_value(loc=loc, ip=ip),
-            value.ir_value(loc=loc, ip=ip),
+            low_32_bits,
             Int32(offset).ir_value(loc=loc, ip=ip),
             Int32(mask_and_clamp).ir_value(loc=loc, ip=ip),
             kind,
             loc=loc,
             ip=ip,
         )
-    )
+        high_32_bits_shfl = nvvm.shfl_sync(
+            T.i32(),
+            Int32(mask).ir_value(loc=loc, ip=ip),
+            high_32_bits,
+            Int32(offset).ir_value(loc=loc, ip=ip),
+            Int32(mask_and_clamp).ir_value(loc=loc, ip=ip),
+            kind,
+            loc=loc,
+            ip=ip,
+        )
 
+        # combine low and high 32 bits
+        low_64_bit = llvm.zext(T.i64(), low_32_bits_shfl, loc=loc, ip=ip)
+        high_64_bit = llvm.zext(T.i64(), high_32_bits_shfl, loc=loc, ip=ip)
+        shlf_res = llvm.shl(
+            high_64_bit,
+            Int64(32).ir_value(loc=loc, ip=ip),
+            llvm.IntegerOverflowFlags.none,
+            loc=loc,
+            ip=ip,
+        )
+        shlf_res = llvm.or_(shlf_res, low_64_bit, loc=loc, ip=ip)
+        shlf_res = llvm.bitcast(orig_type.mlir_type, shlf_res, loc=loc, ip=ip)
+        return orig_type(shlf_res)
 
 shuffle_sync = partial(shuffle_sync_op, kind=nvvm.ShflKind.idx)
 shuffle_sync_up = partial(shuffle_sync_op, kind=nvvm.ShflKind.up)
@@ -224,6 +315,25 @@ def barrier(*, barrier_id=None, number_of_threads=None, loc=None, ip=None) -> No
     nvvm.barrier(
         barrier_id=barrier_id, number_of_threads=number_of_threads, loc=loc, ip=ip
     )
+
+
+@dsl_user_op
+def barrier_arrive(
+    *, barrier_id=None, number_of_threads=None, loc=None, ip=None
+) -> None:
+    if barrier_id is not None:
+        barrier_id = Int32(barrier_id).ir_value(loc=loc, ip=ip)
+
+    if number_of_threads is None:
+        raise ValueError(
+            "barrier_arrive needs pass number_of_threads to arrive the barrier",
+        )
+    number_of_threads = Int32(number_of_threads).ir_value(loc=loc, ip=ip)
+
+    nvvm.barrier_arrive(
+        barrier_id=barrier_id, number_of_threads=number_of_threads, loc=loc, ip=ip
+    )
+
 
 @dsl_user_op
 def sync_threads(*, loc=None, ip=None) -> None:
@@ -533,6 +643,9 @@ def rcp_approx(a: Union[float, Float32], *, loc=None, ip=None):
 
 
 @dsl_user_op
+@deprecated(
+    "cute.arch.exp2 is deprecated, use cute.math.exp2 with `fastmath=True` instead"
+)
 def exp2(a: Union[float, Float32], *, loc=None, ip=None) -> Float32:
     return Float32(
         llvm.inline_asm(
@@ -545,3 +658,24 @@ def exp2(a: Union[float, Float32], *, loc=None, ip=None) -> Float32:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
+
+@dsl_user_op
+@deprecated(
+    "cute.arch.exp is deprecated, use cute.math.exp with `fastmath=True` instead"
+)
+def exp(a: Union[float, Float32], *, loc=None, ip=None) -> Float32:
+    LOG2_E = 1.4426950408889634
+    return exp2(a * LOG2_E, loc=loc, ip=ip)
+
+
+@dsl_user_op
+@deprecated(
+    "cute.arch.exp_packed_f32x2 is deprecated, use cute.arch.mul_packed_f32x2 and cute.math.exp2 with `fastmath=True` instead"
+)
+def exp_packed_f32x2(
+    a: Tuple[Float32, Float32], *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
+    LOG2_E = Float32(1.4426950408889634)
+    b = mul_packed_f32x2(a, (LOG2_E, LOG2_E), loc=loc, ip=ip)
+    return exp2(b[0], loc=loc, ip=ip), exp2(b[1], loc=loc, ip=ip)
