@@ -34,7 +34,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
-
+set(CMAKE_BUILD_TYPE Debug)
+# set(CMAKE_CUDA_FLAGS_DEBUG "-G -O0 -g -lineinfo") 
+# set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math")
 # Find CUDA
 find_package(CUDAToolkit REQUIRED)
 enable_language(CUDA)
@@ -69,11 +71,11 @@ target_include_directories(cutlass_run PRIVATE
 # Set CUDA properties
 set_target_properties(cutlass_run PROPERTIES
     CUDA_ARCHITECTURES "89;"
-    CUDA_SEPARABLE_COMPILATION ON
+    # CUDA_SEPARABLE_COMPILATION ON
 )
 
-# Link libraries
-target_link_libraries(cutlass_run
-    CUDA::cudart
-    CUDA::cublas
-)
+# # Link libraries
+# target_link_libraries(cutlass_run
+#     CUDA::cudart
+#     CUDA::cublas
+# )
