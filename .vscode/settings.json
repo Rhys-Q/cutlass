@@ -66,6 +66,10 @@
         "streambuf": "cpp",
         "thread": "cpp",
         "typeinfo": "cpp",
-        "variant": "cpp"
+        "variant": "cpp",
+        "__config": "cpp",
+        "__functional_base": "cpp",
+        "version": "cpp",
+        "__availability": "cpp"
     }
 }

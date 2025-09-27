@@ -52,7 +52,7 @@ message("CUTLASS_SOURCE_DIR: ${CUTLASS_SOURCE_DIR}")
 
 # Create the executable first
 file(GLOB CUDA_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/sgemm_1.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/study_sgemm_1.cu"
 )
 message( STATUS "CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}" )
 message( STATUS "CUDA_SOURCES: ${CUDA_SOURCES}" )
