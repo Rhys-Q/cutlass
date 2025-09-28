@@ -10,6 +10,42 @@ __global__ static __launch_bounds__(decltype(size(CThreadLayout{}))::value) void
     TB const *B, BStride dB, BSmemLayout sB_layout, BThreadLayout tB,
     TC *C, CStride dC, CSmemLayout sC, CThreadLayout tC)
 {
+  // check
+  CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});
+  CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{});
+
+  static_assert(is_static<AThreadLayout>::value);
+  static_assert(is_static<BThreadLayout>::value);
+  static_assert(is_static<CThreadLayout>::value);
+
+  // 256
+  CUTE_STATIC_ASSERT_V(size(tA) == size(tB));
+  CUTE_STATIC_ASSERT_V(size(tC) == size(tA));
+
+  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tA) == Int<0>{});
+  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tA) == Int<0>{});
+
+  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<0>(tB) == Int<0>{});
+  CUTE_STATIC_ASSERT_V(size<2>(cta_tiler) % size<1>(tB) == Int<0>{});
+
+  CUTE_STATIC_ASSERT_V(size<0>(cta_tiler) % size<0>(tC) == Int<0>{});
+  CUTE_STATIC_ASSERT_V(size<1>(cta_tiler) % size<1>(tC) == Int<0>{});
+
+  static_assert(is_static<ASmemLayout>::value);
+  static_assert(is_static<BSmemLayout>::value);
+  static_assert(is_static<CSmemLayout>::value);
+
+  CUTE_STATIC_ASSERT_V(size<0>(ASmemLayout{}) == size<0>(cta_tiler)); // BLK_M
+  CUTE_STATIC_ASSERT_V(size<0>(CSmemLayout{}) == size<0>(cta_tiler)); // BLK_M
+  CUTE_STATIC_ASSERT_V(size<0>(BSmemLayout{}) == size<1>(cta_tiler)); // BLK_N
+  CUTE_STATIC_ASSERT_V(size<1>(CSmemLayout{}) == size<1>(cta_tiler)); // BLK_N
+  CUTE_STATIC_ASSERT_V(size<1>(ASmemLayout{}) == size<2>(cta_tiler)); // BLK_K
+  CUTE_STATIC_ASSERT_V(size<1>(BSmemLayout{}) == size<2>(cta_tiler)); // BLK_K
+  CUTE_STATIC_ASSERT_V(congruent(select<0, 2>(shape_MNK), dA));       // dA strides for shape MK
+  CUTE_STATIC_ASSERT_V(congruent(select<1, 2>(shape_MNK), dB));       // dB strides for shape NK
+  CUTE_STATIC_ASSERT_V(congruent(select<0, 1>(shape_MNK), dC));       // dC strides for shape MN
+
+  // make tensor
 }
 
 template <class TA, class TB, class TC>
