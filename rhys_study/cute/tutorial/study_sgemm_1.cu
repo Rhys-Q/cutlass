@@ -3,10 +3,21 @@
 #include <thrust/device_vector.h>
 #include "cutlass/util/helper_cuda.hpp"
 
+template <class ProblemShape, class CtaTiler, class TA, class AStride, class ASmemLayout, class AThreadLayout,
+          class TB, class BStride, class BSmemLayout, class BThreadLayout, class TC, class CStride, class CSmemLayout, class CThreadLayout>
+__global__ static __launch_bounds__(decltype(size(CThreadLayout{}))::value) void gemm_kernel(
+    ProblemShape shape_MNK, CtaTiler cta_tiler, TA const *A, AStride dA, ASmemLayout sA, AThreadLayout tA,
+    TB const *B, BStride dB, BSmemLayout sB_layout, BThreadLayout tB,
+    TC *C, CStride dC, CSmemLayout sC, CThreadLayout tC)
+{
+}
+
 template <class TA, class TB, class TC>
 void gemm(int m, int n, int k, TA const *A, TB const *B, TC *C)
 {
   using namespace cute;
+
+  auto prob_shape = make_shape(m, n, k);
   // calculate cta tiler
 
   auto bM = Int<128>{};
@@ -26,12 +37,17 @@ void gemm(int m, int n, int k, TA const *A, TB const *B, TC *C)
   auto sC = make_layout(make_shape(bM, bN));
 
   // calculate thread layout
-  auto tA = make_layout(make_shape(32, 8));
-  auto tB = make_layout(make_shape(32, 8));
-  auto tC = make_layout(make_shape(16, 16));
+  auto tA = make_layout(make_shape(Int<32>{}, Int<8>{}));
+  auto tB = make_layout(make_shape(Int<32>{}, Int<8>{}));
+  auto tC = make_layout(make_shape(Int<16>{}, Int<16>{}));
 
   dim3 dimBlock(size(tC));
-  dim3 dimGrid(size(ceil_div(m, bM)), size(n, bN));
+  dim3 dimGrid(size(ceil_div(m, bM)), size(ceil_div(n, bN)));
+  cudaStream_t stream = 0;
+  gemm_kernel<<<dimGrid, dimBlock, 0, stream>>>(
+      prob_shape, cta_tiler, A, dA, sA, tA,
+      B, dB, sB, tB,
+      C, dC, sC, tC);
 }
 
 int main()
