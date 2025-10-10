@@ -43,6 +43,8 @@ enable_language(CUDA)
 
 set(CUTLASS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../)
 include(${CUTLASS_SOURCE_DIR}/CUDA.cmake)
+include_directories(${CUTLASS_SOURCE_DIR}/include)
+include_directories(${CUTLASS_SOURCE_DIR}/tools/util/include)
 message("CUTLASS_SOURCE_DIR: ${CUTLASS_SOURCE_DIR}")
 
 # add_subdirectory(hopper)
@@ -52,7 +54,7 @@ message("CUTLASS_SOURCE_DIR: ${CUTLASS_SOURCE_DIR}")
 
 # Create the executable first
 file(GLOB CUDA_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/study_sgemm_1.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/layout.cu"
 )
 message( STATUS "CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}" )
 message( STATUS "CUDA_SOURCES: ${CUDA_SOURCES}" )
