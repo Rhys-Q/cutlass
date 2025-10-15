@@ -105,7 +105,30 @@ void test_shape_strides() {
   print(stride);
 }
 
+void test_layout_basic() {
+  auto layout = make_layout(make_shape(Int<2>{}, Int<3>{}),
+                            make_stride(Int<2>{}, Int<3>{}));
+  print(layout);
+  print("\n");
+  print(rank(layout));
+  print("\n");
+  print(get<0>(layout));
+  print("\n");
+  print(depth(layout));
+  print("\n");
+
+  print(shape(layout));
+  print("\n");
+  print(stride(layout));
+  print("\n");
+  print(size(layout));
+  print("\n");
+
+  print(cosize(layout));
+  print("\n");
+}
+
 int main() {
-  test_shape_strides();
+  test_layout_basic();
   return 0;
 }
