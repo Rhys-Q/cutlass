@@ -96,7 +96,16 @@ void test_int_tuple() {
   std::cout << size<1>(tup3) << std::endl;
   std::cout << size<2>(tup3) << std::endl;
 }
+
+void test_shape_strides() {
+  auto shape = make_shape(Int<2>{}, Int<3>{});
+  print(shape);
+
+  auto stride = make_stride(Int<2>{}, Int<3>{});
+  print(stride);
+}
+
 int main() {
-  test_int_tuple();
+  test_shape_strides();
   return 0;
 }
