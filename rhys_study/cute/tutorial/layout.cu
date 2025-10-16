@@ -128,7 +128,17 @@ void test_layout_basic() {
   print("\n");
 }
 
+void test_hierarchical_access() {
+  auto layout = make_layout(
+      make_shape(Int<2>{}, Int<3>{}, make_shape(Int<4>{}, Int<5>{})),
+      make_stride(Int<2>{}, Int<3>{}, make_stride(Int<4>{}, Int<5>{})));
+  print(get<2, 0>(layout));
+  print("\n");
+  print(rank<2, 0>(layout));
+  print("\n");
+}
+
 int main() {
-  test_layout_basic();
+  test_hierarchical_access();
   return 0;
 }
