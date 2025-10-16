@@ -1,4 +1,5 @@
 #include "cute/int_tuple.hpp"
+#include "cute/util/print_tensor.hpp"
 #include "cute/util/type_traits.hpp"
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/helper_cuda.hpp"
@@ -138,7 +139,59 @@ void test_hierarchical_access() {
   print("\n");
 }
 
+void test_constructing_layout() {
+  Layout s8 = make_layout(Int<8>{});
+  print(s8);
+  print("\n");
+  Layout d8 = make_layout(8);
+  print(d8);
+  print("\n");
+  Layout s2xs4 = make_layout(make_shape(Int<2>{}, Int<4>{}));
+  print(s2xs4);
+  print("\n");
+  Layout s2xd4 = make_layout(make_shape(Int<2>{}, 4));
+  print(s2xd4);
+  print("\n");
+  Layout s2xd4_a =
+      make_layout(make_shape(Int<2>{}, 4), make_stride(Int<12>{}, Int<1>{}));
+  print(s2xd4_a);
+  print("\n");
+  Layout s2xd4_col = make_layout(make_shape(Int<2>{}, 4), LayoutLeft{});
+  print(s2xd4_col);
+  print("\n");
+  Layout s2xd4_row = make_layout(make_shape(Int<2>{}, 4), LayoutRight{});
+  print(s2xd4_row);
+  print("\n");
+  Layout s2xh4 = make_layout(make_shape(2, make_shape(2, 2)),
+                             make_stride(4, make_stride(2, 1)));
+  print(s2xh4);
+  print("\n");
+
+  print(congruent(shape(s2xh4), stride(s2xh4)));
+  print("\n");
+}
+
+template <class Shape, class Stride>
+void print2D(Layout<Shape, Stride> const &layout) {
+  for (int m = 0; m < size<0>(layout); ++m) {
+    for (int n = 0; n < size<1>(layout); ++n) {
+      printf("%3d  ", layout(m, n));
+    }
+    printf("\n");
+  }
+}
+
+void test_print2D() {
+  auto layout = make_layout(make_shape(Int<2>{}, Int<3>{}),
+                            make_stride(Int<2>{}, Int<3>{}));
+  print2D(layout);
+  print("\n");
+  Layout s2xh4 = make_layout(make_shape(2, make_shape(2, 2)),
+                             make_stride(4, make_stride(2, 1)));
+  print_layout(s2xh4);
+}
+
 int main() {
-  test_hierarchical_access();
+  test_print2D();
   return 0;
 }
