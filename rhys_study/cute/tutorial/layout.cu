@@ -1,5 +1,5 @@
 #include "cute/int_tuple.hpp"
-#include "cute/util/print_tensor.hpp"
+// #include "cute/util/print_tensor.hpp"
 #include "cute/util/type_traits.hpp"
 #include "cutlass/util/GPU_Clock.hpp"
 #include "cutlass/util/helper_cuda.hpp"
@@ -191,7 +191,58 @@ void test_print2D() {
   print_layout(s2xh4);
 }
 
+void test_natural_coord() {
+  auto shape = Shape<_3, Shape<_2, _3>>{};
+  print(idx2crd(16, shape));                                    // (1,(1,2))
+  print(idx2crd(_16{}, shape));                                 // (_1,(_1,_2))
+  print(idx2crd(make_coord(1, 5), shape));                      // (1,(1,2))
+  print(idx2crd(make_coord(_1{}, 5), shape));                   // (_1,(1,2))
+  print(idx2crd(make_coord(1, make_coord(1, 2)), shape));       // (1,(1,2))
+  print(idx2crd(make_coord(_1{}, make_coord(1, _2{})), shape)); // (_1,(1,_2))
+}
+
+void test_index_mapping() {
+  auto shape = Shape<_3, Shape<_2, _3>>{};
+  auto stride = Stride<_3, Stride<_12, _1>>{};
+  print(crd2idx(16, shape, stride));                              // 17
+  print(crd2idx(_16{}, shape, stride));                           // _17
+  print(crd2idx(make_coord(1, 5), shape, stride));                // 17
+  print(crd2idx(make_coord(_1{}, 5), shape, stride));             // 17
+  print(crd2idx(make_coord(_1{}, _5{}), shape, stride));          // _17
+  print(crd2idx(make_coord(1, make_coord(1, 2)), shape, stride)); // 17
+  print(
+      crd2idx(make_coord(_1{}, make_coord(_1{}, _2{})), shape, stride)); // _17
+}
+
+void test_sublayout() {
+  Layout a = Layout<Shape<_4, Shape<_3, _6>>>{}; // (4,(3,6)):(1,(4,12))
+  Layout a0 = layout<0>(a);                      // 4:1
+  Layout a1 = layout<1>(a);                      // (3,6):(4,12)
+  Layout a10 = layout<1, 0>(a);                  // 3:4
+  Layout a11 = layout<1, 1>(a);                  // 6:12
+}
+
+void test_concatenation() {
+  Layout a = Layout<_3, _1>{};                  // 3:1
+  Layout b = Layout<_4, _3>{};                  // 4:3
+  Layout row = make_layout(a, b);               // (3,4):(1,3)
+  Layout col = make_layout(b, a);               // (4,3):(3,1)
+  Layout q = make_layout(row, col);             // ((3,4),(4,3)):((1,3),(3,1))
+  Layout aa = make_layout(a);                   // (3):(1)
+  Layout aaa = make_layout(aa);                 // ((3)):((1))
+  Layout d = make_layout(a, make_layout(a), a); // (3,(3),3):(1,(1),1)
+}
+
+void test_concatenation_append() {
+  Layout a = Layout<_3, _1>{}; // 3:1
+  Layout b = Layout<_4, _3>{}; // 4:3
+  Layout ab = append(a, b);    // (3,4):(1,3)
+  Layout ba = prepend(a, b);   // (4,3):(3,1)
+  Layout c = append(ab, ab);   // (3,4,(3,4)):(1,3,(1,3))
+  Layout d = replace<2>(c, b); // (3,4,4):(1,3,3)
+}
+
 int main() {
-  test_print2D();
+  test_concatenation_append();
   return 0;
 }
