@@ -51,7 +51,151 @@ void test_coalesce() {
   print(result); // equal to layout but simpler
 }
 
+// by mode coalesce
+void test_by_mode_coalesce() {
+  auto a = Layout<Shape<_2, Shape<_1, _6>>, Stride<_1, Stride<_6, _2>>>{};
+
+  auto result = coalesce(a, Step<_1, _1>{});
+
+  print(result); // equal to a but simpler
+}
+
+/*
+Composition
+这是cute的核心，被每一个高层的操作所使用
+组合的公式可以如下定义：
+R := A o B
+R(c) := (A o B)(c) := A(B(c))
+Example
+A = (6,2):(8,2)
+B = (4,3):(3,1)
+
+R( 0) = A(B( 0)) = A(B(0,0)) = A( 0) = A(0,0) =  0
+R( 1) = A(B( 1)) = A(B(1,0)) = A( 3) = A(3,0) = 24
+R( 2) = A(B( 2)) = A(B(2,0)) = A( 6) = A(0,1) =  2
+R( 3) = A(B( 3)) = A(B(3,0)) = A( 9) = A(3,1) = 26
+R( 4) = A(B( 4)) = A(B(0,1)) = A( 1) = A(1,0) =  8
+R( 5) = A(B( 5)) = A(B(1,1)) = A( 4) = A(4,0) = 32
+R( 6) = A(B( 6)) = A(B(2,1)) = A( 7) = A(1,1) = 10
+R( 7) = A(B( 7)) = A(B(3,1)) = A(10) = A(4,1) = 34
+R( 8) = A(B( 8)) = A(B(0,2)) = A( 2) = A(2,0) = 16
+R( 9) = A(B( 9)) = A(B(1,2)) = A( 5) = A(5,0) = 40
+R(10) = A(B(10)) = A(B(2,2)) = A( 8) = A(2,1) = 18
+R(11) = A(B(11)) = A(B(3,2)) = A(11) = A(5,1) = 42
+
+如果将R写成layout，则可以写成：
+R = ((2,2),3):((24,2),8) 这是观察得到的
+
+并且：
+compatible(B, R)
+回顾一下compatible的定义：
+compatible(A, B) := for all c in B, A(c) is defined
+这意味着B的每一个坐标都可以作为R的坐标，且B的shape的size和R的shape的size相同
+
+
+Composition 计算
+B = (B_0, B_1, ...) B是由sublayouts组成的layout，比如 (4,3):(3,1) B_0 = (4,3)
+B_1 = (3,1) B = (B_0, B_1)
+
+Composition (A o B) 本质上使用B的stride d 来提取A的元素，再用B的
+shape来截取前s个元素
+
+左分配律：
+A o B = A o (B_0, B_1, ...) = (A o B_0, A o B_1, ...)
+假设B = s:d，A是完全展开的，简化后的layout, A = a:b
+R = A o B = A(B) = a:b o s:d = s:(b*d)
+
+如果A有多个mode，则按照两步走:
+1. 使用B的stride 来除A的shape，得到一个中间的layput
+For example,
+(6,2) /  2 => (3,2)
+(6,2) /  3 => (2,2)
+(6,2) /  6 => (1,2)
+(6,2) / 12 => (1,1)
+(3,6,2,8) /  3 => (1,6,2,8)
+(3,6,2,8) /  6 => (1,3,2,8)
+(3,6,2,8) /  9 => (1,2,2,8)
+(3,6,2,8) / 72 => (1,1,1,4)
+假设A 是 (3, 6, 2, 8):(w, x, y, z)
+中间layout的shape = (3, 6, 2, 8) / 72 = (1, 1, 1, 4)
+中间layout的stride = (72*w, 24*x, 4*y, 2*z)
+
+2. 使用B的shape 来截取中间layout的前s个元素
+首先，从中间layout的最左侧维度开始，逐步用取模的方式，获取s个元素
+计算新的shape：
+For example,
+
+(6,2) %  2 => (2,1)
+(6,2) %  3 => (3,1)
+(6,2) %  6 => (6,1)
+(6,2) % 12 => (6,2)
+(3,6,2,8) %  6 => (3,2,1,1)
+(3,6,2,8) %  9 => (3,3,1,1)
+(1,2,2,8) %  2 => (1,2,1,1)
+(1,2,2,8) % 16 => (1,2,2,4)
+
+最终layout的shape = (1, 1, 1, 4): (9*w, 3*x, y, z)
+**/
+void test_composition() {
+  auto a1 =
+      Layout<Shape<_3, Shape<_6, _2>, _8>, Stride<_1, Stride<_6, _2>, _2>>{};
+  auto b1 = Layout<Shape<_4, _3>, Stride<_3, _1>>{};
+
+  auto a = coalesce(a1);
+  auto b = coalesce(b1);
+
+  std::cout << "a: ";
+  print(a);
+  std::cout << std::endl;
+  std::cout << "b: ";
+  print(b);
+  std::cout << std::endl;
+  auto result = composition(a, b);
+
+  /*
+  A = (3, (6,2), 8):(1, (6,2), 2) = (3, 6, 2, 8):(1, 6, 2, 2)
+  B = (4, 3):(3, 1) = (B0, B1) = ((4:3), (3:1))
+  B0 = (4:3)
+  B1 = (3:1)
+
+  A o B = (A o B0, A o B1)
+
+  A o B0
+  1. 中间layput
+    shape = (3, 6, 2, 8) / 3 = (1, 6, 2, 8)
+    stride = (3, 6, 2, 2)
+
+  2. 取mod
+    shape = (1, 6, 2, 8) % 4 = (1, 4, 1, 1)
+
+  3. 最终layout
+    shape = (1, 4, 1, 1)
+    stride = (3, 6, 2, 2)
+
+  A o B1
+  1. 中间layput
+    shape = (3, 6, 2, 8) / 1 = (3, 6, 2, 8)
+    stride = (1, 6, 2, 2)
+
+  2. 取mod
+    shape = (3, 6, 2, 8) % 3 = (3, 1, 1, 1)
+
+
+  3. 最终layout
+    shape = (3, 1, 1, 1)
+    stride = (1, 6, 2, 2)
+
+  A o B = ((4:6),(3:1)) = (4,3):(6,1)
+
+  */
+
+  std::cout << "result: ";
+  print(result);
+  std::cout << std::endl;
+
+  print(result); // equal to a but simpler
+}
 int main() {
-  test_coalesce();
+  test_composition();
   return 0;
 }
