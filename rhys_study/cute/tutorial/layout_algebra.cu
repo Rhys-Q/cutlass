@@ -6,12 +6,12 @@
 #include "cutlass/util/print_error.hpp"
 #include <cstdint>
 #include <cute/tensor.hpp>
+#include <cutlass/trace.h>
 #include <iostream>
 #include <ostream>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <type_traits>
-
 using namespace cute;
 
 /*
@@ -195,7 +195,134 @@ void test_composition() {
 
   print(result); // equal to a but simpler
 }
+
+// by mode composition
+// https://github.com/Rhys-Q/cutlass/blob/main/media/images/cute/composition1.png
+// 这张图很好解释了composition的本质，就是从A中按照B定义的规则
+// 进行截取，可以实现任意截取
+void test_by_mode_composition() {
+  auto a = make_layout(make_shape(12, make_shape(4, 8)),
+                       make_stride(59, make_stride(13, 1)));
+
+  auto tiler = make_tile(Layout<_3, _4>{}, Layout<_8, _2>{});
+  auto result = composition(a, tiler);
+
+  print(result);
+  std::cout << std::endl;
+
+  auto same_result = make_layout(composition(layout<0>(a), get<0>(tiler)),
+                                 composition(layout<1>(a), get<1>(tiler)));
+
+  print(same_result);
+  std::cout << std::endl;
+}
+
+/**
+tiler可以是以下三种：
+1. 一个Layout
+2. tuple of Layout，即它是支持嵌套的
+3. Shape，会被解释为tuple of Layout with stride-1
+
+tile的作用就是用于composition的第二个参数，对A进行截取，可以实现任意截取
+
+比如对一个MxNxL的tensor，获取它的3x5x8的子layout
+也可以将一个8x16的tensor，reorder为32x4的tensor
+
+
+ */
+
+/*
+Complement 补集
+
+complement(A, M)
+M是一个shape，一般是一个int，表示一个整数
+补集合就是计算一个layout，使得A和补集合的并集是M
+
+*/
+void test_complement() {
+  auto layout = Layout<_1, _0>{};
+  auto result = complement(layout, Int<16>{});
+  print(result);
+  std::cout << std::endl;
+}
+
+/*
+Division (Tiling)
+
+template <class LShape, class LStride,
+          class TShape, class TStride>
+auto logical_divide(Layout<LShape,LStride> const& layout,
+                    Layout<TShape,TStride> const& tiler)
+{
+  return composition(layout, make_layout(tiler, complement(tiler,
+size(layout))));
+}
+
+A⊘B := A o (B,B*)
+B* = complement(B, size(A))
+
+将A分为两个部分，第一个部分是B所截取的，第二个部分是B的补集所截取的，也就是B没有截取的
+
+After the divide, the first mode of the result is the tile of data and the
+second mode of the result iterates over each tile.
+
+第一个mode是tile of data，第二个mode是iterates over each tile.
+https://github.com/Rhys-Q/cutlass/blob/main/media/images/cute/divide1.png
+*/
+void test_logical_divide() {
+  auto layout = Layout<Shape<_4, _2, _3>, Stride<_2, _1, _8>>{};
+  auto tiler = Layout<_4, _2>{};
+  auto result = logical_divide(layout, tiler);
+  print(result);
+  std::cout << std::endl;
+}
+
+/*
+zipped Tiled Flat Divides
+
+Layout Shape : (M, N, L, ...)
+Tiler Shape  : <TileM, TileN>
+
+logical_divide : ((TileM,RestM), (TileN,RestN), L, ...)
+zipped_divide  : ((TileM,TileN), (RestM,RestN,L,...))
+tiled_divide   : ((TileM,TileN), RestM, RestN, L, ...)
+flat_divide    : (TileM, TileN, RestM, RestN, L, ...)
+
+是对logical_divide的封装，将结果的第二个mode进行聚合，得到不同的结果
+
+layout<0>(zipped_divide(a, b)) == composition(a, b)
+layout<1>(zipped_divide(a, b)) == composition(a,complement(b, size(a)))
+*/
+
+/*
+Product(Tiling)
+
+logical_product(Layout, Layout)
+A ⊗ B := (A, A* o B)
+
+template <class LShape, class LStride,
+          class TShape, class TStride>
+auto logical_product(Layout<LShape,LStride> const& layout,
+                     Layout<TShape,TStride> const& tiler)
+{
+  return make_layout(layout, composition(complement(layout,
+size(layout)*cosize(tiler)), tiler));
+}
+
+I can not understand totally, maybe I need to read the paper again.
+*/
+
+/*
+Zipped and Tiled Products
+Layout Shape : (M, N, L, ...)
+Tiler Shape  : <TileM, TileN>
+
+logical_product : ((M,TileM), (N,TileN), L, ...)
+zipped_product  : ((M,N), (TileM,TileN,L,...))
+tiled_product   : ((M,N), TileM, TileN, L, ...)
+flat_product    : (M, N, TileM, TileN, L, ...)
+*/
 int main() {
-  test_composition();
+  test_logical_divide();
   return 0;
 }
