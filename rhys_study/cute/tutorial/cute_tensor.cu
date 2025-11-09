@@ -200,7 +200,82 @@ void test_slicing_tensor()
 
 /*
 Partitioning a Tensor
+tensor paritition 由 composition 或者 tiling + slicing组成。
+主要有三种partition:
+1. inner-partitioning
+2. outer-partitioning
+3. TV-layout-partitioning
 */
+
+/*
+Inner and outer partitioning
+
+Tensor A = make_tensor(ptr, make_shape(8,24));  // (8,24)
+auto tiler = Shape<_4,_8>{};                    // (_4,_8)
+
+Tensor tiled_a = zipped_divide(A, tiler);       // ((_4,_8),(2,3))
+这种partition称为inner-partitioning，因为它 keep the inner "tile" mode
+我们提供了inner_partition(Tensor, Tiler, Coord)的接口来支持inner-partitioning
+
+local_tile 是inner_partition的另一个名称，经常用于将一个tensor 分配给thread group
+
+另外一种情况是，假设我有32个thread，每个thread处理4x8中的一个元素：
+Tensor thr_a = tiled_a(threadIdx.x, make_coord(_,_)); // (2,3)
+这是outer-partition，因为它keep the outer "rest" mode.
+
+我理解 Tensor tiled_a = zipped_divide(A, tiler); // ((_4,_8),(2,3))
+tile_a 组成：(inner_tile=(4,8), outer_rest=(2,3))
+inner_partition keep inner 不动
+outer_partition keep outer 不动
+
+对于outer-partitioning，我们提供了outer_partition(Tensor, Tiler, Coord)的接口
+此外，local_partition(Tensor, Tiler, Idx) 也是它的别称
+*/
+
+/*
+TV-layout-partitioning
+
+// Construct a TV-layout that maps 8 thread indices and 4 value indices
+//   to 1D coordinates within a 4x8 tensor
+// (T8,V4) -> (M4,N8)
+auto tv_layout = Layout<Shape <Shape <_2,_4>,Shape <_2, _2>>,
+                        Stride<Stride<_8,_1>,Stride<_4,_16>>>{}; // (8,4)
+
+// Construct a 4x8 tensor with any layout
+Tensor A = make_tensor<float>(Shape<_4,_8>{}, LayoutRight{});    // (4,8)
+// Compose A with the tv_layout to transform its shape and order
+Tensor tv = composition(A, tv_layout);                           // (8,4)
+// Slice so each thread has 4 values in the shape and order that the tv_layout prescribes
+Tensor  v = tv(threadIdx.x, _);                                  // (4)
+
+*/
+
+/*
+Copy a subtile from global memory to registers
+*/
+void test_copy_tile()
+{
+  // Tensor gmem = make_tensor(ptr, make_shape(Int<8>{}, 16));
+  // Tensor rmem = make_tensor_like(gmem(_, 0));
+  // for (int j = 0; j < size<1>(gmem); ++j)
+  // {
+  //   // copy(gemem(_, j), rmem);
+  //   // do something with rmem
+  // }
+  float *ptr = new float[24 * 16];
+
+  Tensor gmem = make_tensor(ptr, make_shape(24, 16)); // (24,16)
+
+  auto tiler = Shape<_8, _4>{}; // 8x4 tiler
+  // auto tiler       = Tile<Layout<_8,_3>, Layout<_4,_2>>{};  // 8x4 tiler with stride-3 and stride-2
+  Tensor gmem_tiled = zipped_divide(gmem, tiler);   // ((_8,_4),Rest)
+  Tensor rmem = make_tensor_like(gmem_tiled(_, 0)); // ((_8,_4))
+  for (int j = 0; j < size<1>(gmem_tiled); ++j)
+  {
+    copy(gmem_tiled(_, j), rmem);
+    // do_something(rmem);
+  }
+}
 
 int main()
 {
