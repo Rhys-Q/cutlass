@@ -54,7 +54,7 @@ message("CUTLASS_SOURCE_DIR: ${CUTLASS_SOURCE_DIR}")
 
 # Create the executable first
 file(GLOB CUDA_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/cute_tensor.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cute_algorithms.cu"
 )
 message( STATUS "CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}" )
 message( STATUS "CUDA_SOURCES: ${CUDA_SOURCES}" )
