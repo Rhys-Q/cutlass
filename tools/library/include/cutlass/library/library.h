@@ -392,9 +392,10 @@ struct BlockScaledGemmArguments {
 
   library::RuntimeDatatype runtime_input_datatype_a{library::RuntimeDatatype::kStatic}; 
   library::RuntimeDatatype runtime_input_datatype_b{library::RuntimeDatatype::kStatic}; 
-
+  int device_index{0};
   bool use_pdl{false};
 };
+
 
 /// Blockwise GEMM
 //
@@ -591,6 +592,9 @@ struct GemmGroupedArguments {
   // underlying operation uses the one it needs.
   cute::Shape<int, int, int>* problem_sizes_3x;
   cute::Shape<int, int, int>* problem_sizes_3x_host;
+  std::vector<int32_t> max_problem_size_3x;
+  int32_t* tokens_per_expert{nullptr};
+  int32_t* tokens_per_expert_host{nullptr};
 };
 
 struct GroupedGemmBlockScaledArguments : GemmGroupedArguments {

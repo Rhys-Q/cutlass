@@ -9,18 +9,12 @@
 # and related documentation outside the scope permitted by the EULA
 # is strictly prohibited.
 
+from .c_header_generator import CHeaderGenerator
+from .export import get_export_module, dump_to_object, export_to_c
 
-SMEM_CAPACITY_MAP = {
-    "sm_120": (100 - 1) * 1024,
-    "sm_100": (228 - 1) * 1024,
-    "sm_90": (228 - 1) * 1024,
-    "sm_80": (164 - 1) * 1024,
-    "sm_86": (100 - 1) * 1024,
-    "sm_89": (100 - 1) * 1024,
-}
-
-
-def get_smem_capacity_in_bytes(compute_capability: str) -> int:
-    if compute_capability not in SMEM_CAPACITY_MAP:
-        raise ValueError(f"Unsupported compute capability: {compute_capability}")
-    return SMEM_CAPACITY_MAP[compute_capability]
+__all__ = [
+    "CHeaderGenerator",
+    "get_export_module",
+    "dump_to_object",
+    "export_to_c",
+]
