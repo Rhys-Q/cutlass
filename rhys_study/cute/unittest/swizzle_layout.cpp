@@ -35,7 +35,7 @@
 
 #include <cute/tensor_impl.hpp>
 #include <cute/swizzle_layout.hpp>
-
+#include <cute/util/print_latex.hpp>
 template <class SwLayout>
 void test_swizzle_2d(SwLayout const &sw_layout)
 {
@@ -97,9 +97,12 @@ int main()
   using namespace cute;
 
   {
+    auto layout = Layout<Shape<_8, _8>,
+                         Stride<_8, _1>>{};
+    print_latex(layout);
     auto sw_layout = composition(Swizzle<3, 0, 3>{},
-                                 Layout<Shape<_8, _8>,
-                                        Stride<_8, _1>>{});
+                                 layout);
+    print_latex(sw_layout);
     test_swizzle_2d(sw_layout);
   }
 
