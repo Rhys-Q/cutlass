@@ -36,12 +36,14 @@ static-1 的维度，在natural coord的情况下，
 举个例子，(_2, _4):(_1, _2) 符合第3个场景，可以合并为(_8):(_1)
 
 */
-void test_coalesce() {
+void test_coalesce()
+{
   auto layout = Layout<Shape<_2, Shape<_1, _6>>, Stride<_1, Stride<_6, _2>>>{};
 
   print(layout);
 
-  for (int i = 0; i < size(layout); i++) {
+  for (int i = 0; i < size(layout); i++)
+  {
     print(crd2idx(i, layout.shape(),
                   layout.stride())); // 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
   }
@@ -52,7 +54,8 @@ void test_coalesce() {
 }
 
 // by mode coalesce
-void test_by_mode_coalesce() {
+void test_by_mode_coalesce()
+{
   auto a = Layout<Shape<_2, Shape<_1, _6>>, Stride<_1, Stride<_6, _2>>>{};
 
   auto result = coalesce(a, Step<_1, _1>{});
@@ -136,7 +139,8 @@ For example,
 
 最终layout的shape = (1, 1, 1, 4): (9*w, 3*x, y, z)
 **/
-void test_composition() {
+void test_composition()
+{
   auto a1 =
       Layout<Shape<_3, Shape<_6, _2>, _8>, Stride<_1, Stride<_6, _2>, _2>>{};
   auto b1 = Layout<Shape<_4, _3>, Stride<_3, _1>>{};
@@ -200,7 +204,8 @@ void test_composition() {
 // https://github.com/Rhys-Q/cutlass/blob/main/media/images/cute/composition1.png
 // 这张图很好解释了composition的本质，就是从A中按照B定义的规则
 // 进行截取，可以实现任意截取
-void test_by_mode_composition() {
+void test_by_mode_composition()
+{
   auto a = make_layout(make_shape(12, make_shape(4, 8)),
                        make_stride(59, make_stride(13, 1)));
 
@@ -239,7 +244,8 @@ M是一个shape，一般是一个int，表示一个整数
 补集合就是计算一个layout，使得A和补集合的并集是M
 
 */
-void test_complement() {
+void test_complement()
+{
   auto layout = Layout<_1, _0>{};
   auto result = complement(layout, Int<16>{});
   print(result);
@@ -269,11 +275,18 @@ second mode of the result iterates over each tile.
 第一个mode是tile of data，第二个mode是iterates over each tile.
 https://github.com/Rhys-Q/cutlass/blob/main/media/images/cute/divide1.png
 */
-void test_logical_divide() {
+void test_logical_divide()
+{
   auto layout = Layout<Shape<_4, _2, _3>, Stride<_2, _1, _8>>{};
   auto tiler = Layout<_4, _2>{};
+  print(layout);
+  print(tiler);
+  // print_latex(layout);
   auto result = logical_divide(layout, tiler);
+  auto result1 = tiled_divide(layout, tiler);
   print(result);
+  print_latex(result);
+  print_latex(result1);
   std::cout << std::endl;
 }
 
@@ -322,7 +335,8 @@ zipped_product  : ((M,N), (TileM,TileN,L,...))
 tiled_product   : ((M,N), TileM, TileN, L, ...)
 flat_product    : (M, N, TileM, TileN, L, ...)
 */
-int main() {
+int main()
+{
   test_logical_divide();
   return 0;
 }
