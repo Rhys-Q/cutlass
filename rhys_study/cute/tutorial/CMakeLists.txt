@@ -54,7 +54,7 @@ message("CUTLASS_SOURCE_DIR: ${CUTLASS_SOURCE_DIR}")
 
 # Create the executable first
 file(GLOB CUDA_SOURCES
-    "${CMAKE_CURRENT_SOURCE_DIR}/tiled_copy.cu"
+    "${CMAKE_CURRENT_SOURCE_DIR}/sgemm_sm80.cu"
 # "${CMAKE_CURRENT_SOURCE_DIR}/layout_algebra.cu"
 )
 message( STATUS "CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}" )
@@ -73,7 +73,7 @@ target_include_directories(cutlass_run PRIVATE
 
 # Set CUDA properties
 set_target_properties(cutlass_run PROPERTIES
-    CUDA_ARCHITECTURES "89;80"
+    CUDA_ARCHITECTURES "89;80;86"
     # CUDA_SEPARABLE_COMPILATION ON
 )
 

@@ -183,7 +183,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   Tensor tXsB = s2r_thr_copy_b.partition_S(sB);                        // (CPY,MMA_N,MMA_K,PIPE)
   Tensor tXrB = s2r_thr_copy_b.retile_D(tCrB);                         // (CPY,MMA_N,MMA_K)
 
-#if 0
+#if 1
   if(thread0()) {
     print("  mA : "); print(  mA); print("\n");
     print("  gA : "); print(  gA); print("\n");
@@ -203,7 +203,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   }
 #endif
 
-#if 0
+#if 1
   if(thread0()) {
     print("  mC : "); print(  mC); print("\n");
     print("  gC : "); print(  gC); print("\n");
@@ -632,11 +632,11 @@ int main(int argc, char** argv)
   if (argc >= 4)
     sscanf(argv[3], "%d", &k);
 
-  char transA = 'N';
+  char transA = 'T';
   if (argc >= 5)
     sscanf(argv[4], "%c", &transA);
 
-  char transB = 'T';
+  char transB = 'N';
   if (argc >= 6)
     sscanf(argv[5], "%c", &transB);
 
@@ -700,18 +700,18 @@ int main(int argc, char** argv)
   thrust::host_vector<TC> cute_result = d_C;
 
   // Timing iterations
-  timer.start();
-  for (int i = 0; i < timing_iterations; ++i) {
-    gemm(transA, transB, m, n, k,
-         alpha,
-         d_A.data().get(), ldA,
-         d_B.data().get(), ldB,
-         beta,
-         d_C.data().get(), ldC);
-  }
-  double cute_time = timer.seconds() / timing_iterations;
-  CUTE_CHECK_LAST();
-  printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
+  // timer.start();
+  // for (int i = 0; i < timing_iterations; ++i) {
+  //   gemm(transA, transB, m, n, k,
+  //        alpha,
+  //        d_A.data().get(), ldA,
+  //        d_B.data().get(), ldB,
+  //        beta,
+  //        d_C.data().get(), ldC);
+  // }
+  // double cute_time = timer.seconds() / timing_iterations;
+  // CUTE_CHECK_LAST();
+  // printf("CUTE_GEMM:     [%6.1f]GFlop/s  (%6.4f)ms\n", gflops / cute_time, cute_time*1000);
 
   return 0;
 }
